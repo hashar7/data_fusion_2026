@@ -202,7 +202,13 @@ def generate_fraud_features_v4(
         col("web_rdp_connection").fill_null(0).cast(pl.Int8).alias("web_rdp_connection_flag"),
         when(col("developer_tools") == "true").then(1).otherwise(0).cast(pl.Int8).alias("developer_tools_flag"),
         col("phone_voip_call_state").fill_null(0).cast(pl.Int8).alias("phone_voip_call_flag"),
-        when(col("battery").cast(pl.Float64).fill_null(100) < 15).then(1).otherwise(0).cast(pl.Int8).alias("low_battery_flag"),
+        when(
+            col("battery")
+            .str.extract(r"(\d+(?:\.\d+)?)\s*%", 1)   # pull the first number before '%'
+            .cast(pl.Float64)
+            .fill_null(100)                             # treat missing/unparseable as 100 (not low)
+            < 15
+        ).then(1).otherwise(0).cast(pl.Int8).alias("low_battery_flag"),
     ])
 
     lf = lf.with_columns([
