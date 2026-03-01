@@ -1,6 +1,6 @@
 import polars as pl
 from polars import col, lit, when
-from feature_engineering import generate_fraud_features_v4
+from scripts.feature_engineering import generate_fraud_features_v4
 
 # =============================================================================
 # Main pipeline: build the processed feature dataset from pretrain + train data
