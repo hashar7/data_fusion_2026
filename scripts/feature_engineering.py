@@ -103,18 +103,23 @@ def generate_fraud_features_v4(
     # SECTION B: Behavioral & User History (Cumulative)
     # =========================================================================
     lf = lf.with_columns([
-        col("event_id").cum_count().over("customer_id").alias("tx_count_lifetime"),
+        # Subtract 1 so each value reflects the count of transactions BEFORE the
+        # current row (i.e. strictly historical).  cum_count() includes the current
+        # row by design, which would leak the current transaction into its own feature.
+        (col("event_id").cum_count().over("customer_id") - 1).alias("tx_count_lifetime"),
         (col("event_dttm").diff().over("customer_id").dt.total_minutes().fill_null(0)).alias("time_since_last_tx_minutes"),
-        col("mcc_code").cum_count().over(["customer_id", "mcc_code"]).alias("mcc_freq_user_cum"),
-        col("pos_cd").cum_count().over(["customer_id", "pos_cd"]).alias("pos_freq_user_cum"),
+        (col("mcc_code").cum_count().over(["customer_id", "mcc_code"]) - 1).alias("mcc_freq_user_cum"),
+        (col("pos_cd").cum_count().over(["customer_id", "pos_cd"]) - 1).alias("pos_freq_user_cum"),
     ])
 
     lf = lf.with_columns([
         # FIX 2: merchant_category_is_new_for_user was identical to mcc_is_new_for_user → removed.
-        (col("mcc_freq_user_cum") == 1).cast(pl.Int8).alias("mcc_is_new_for_user"),
-        (col("pos_freq_user_cum") == 1).cast(pl.Int8).alias("pos_cd_is_new"),
-        (col("mcc_freq_user_cum") / col("tx_count_lifetime")).alias("mcc_transaction_share_user"),
-        (col("pos_freq_user_cum") / col("tx_count_lifetime")).alias("pos_cd_transaction_share_user"),
+        # After the -1 shift, 0 means "never seen before this transaction" (was 1).
+        (col("mcc_freq_user_cum") == 0).cast(pl.Int8).alias("mcc_is_new_for_user"),
+        (col("pos_freq_user_cum") == 0).cast(pl.Int8).alias("pos_cd_is_new"),
+        # fill_null(0): tx_count_lifetime == 0 on the very first transaction → 0/0 → 0.
+        (col("mcc_freq_user_cum") / col("tx_count_lifetime")).fill_null(0).alias("mcc_transaction_share_user"),
+        (col("pos_freq_user_cum") / col("tx_count_lifetime")).fill_null(0).alias("pos_cd_transaction_share_user"),
         (col("mcc_code") != col("mcc_code").shift(1).over("customer_id")).fill_null(False).cast(pl.Int8).alias("merchant_switch_flag"),
         col("time_since_last_tx_minutes").rolling_mean(window_size=3).over("customer_id").alias("time_since_last_3_tx_mean"),
         col("mcc_freq_user_cum").alias("mcc_frequency_user"),
@@ -132,6 +137,12 @@ def generate_fraud_features_v4(
                 index_column="event_dttm",
                 period=period,
                 by="customer_id",
+                # closed="left" → window is [t - period, t), which excludes the
+                # current transaction's timestamp.  The default "right" uses
+                # (t - period, t], meaning the current row is always in its own
+                # window — leaking the current amount/channel/etc. into the very
+                # aggregates used to judge how unusual it is.
+                closed="left",
             )
             .agg([
                 pl.len().alias(f"tx_count_{suffix}"),
@@ -144,8 +155,14 @@ def generate_fraud_features_v4(
                 col("channel_indicator_type").n_unique().alias(f"channel_diversity_{suffix}"),
                 col("operating_system_type").n_unique().alias(f"device_diversity_{suffix}"),
                 col("mcc_code").n_unique().alias(f"merchant_diversity_{suffix}"),
-                col("temp_row_idx").last().alias("temp_row_idx"),
             ])
+            # Rolling preserves input row order → with_row_index produces the same
+            # 0-based sequence as the temp_row_idx already on lf, guaranteeing a
+            # 1-to-1 join even when multiple transactions share the same event_dttm.
+            # The old approach (col("temp_row_idx").last() inside .agg()) returned
+            # the *last* temp_row_idx within the window, so timestamp-tied rows all
+            # got the same key → many-to-many join → duplicate output rows.
+            .with_row_index("temp_row_idx")
             .select([col("temp_row_idx"), pl.exclude(["customer_id", "event_dttm", "temp_row_idx"])])
         )
 
@@ -212,16 +229,25 @@ def generate_fraud_features_v4(
     ])
 
     lf = lf.with_columns([
-        (col("operating_system_type").cum_count().over(["customer_id", "operating_system_type"]) == 1).cast(pl.Int8).alias("operating_system_is_new"),
-        (col("device_system_version").cum_count().over(["customer_id", "device_system_version"]) == 1).cast(pl.Int8).alias("os_version_is_new"),
-        (col("screen_size").cum_count().over(["customer_id", "screen_size"]) == 1).cast(pl.Int8).alias("screen_size_is_new"),
-        (col("timezone").cum_count().over(["customer_id", "timezone"]) == 1).cast(pl.Int8).alias("timezone_is_new"),
-        (col("accept_language").cum_count().over(["customer_id", "accept_language"]) == 1).cast(pl.Int8).alias("accept_language_is_new"),
+        # Same -1 shift as Section B: check == 0 (zero prior uses) rather than
+        # == 1 (first occurrence including the current row).
+        (col("operating_system_type").cum_count().over(["customer_id", "operating_system_type"]) - 1 == 0).cast(pl.Int8).alias("operating_system_is_new"),
+        (col("device_system_version").cum_count().over(["customer_id", "device_system_version"]) - 1 == 0).cast(pl.Int8).alias("os_version_is_new"),
+        (col("screen_size").cum_count().over(["customer_id", "screen_size"]) - 1 == 0).cast(pl.Int8).alias("screen_size_is_new"),
+        (col("timezone").cum_count().over(["customer_id", "timezone"]) - 1 == 0).cast(pl.Int8).alias("timezone_is_new"),
+        (col("accept_language").cum_count().over(["customer_id", "accept_language"]) - 1 == 0).cast(pl.Int8).alias("accept_language_is_new"),
         (col("compromised_flag") * 5 + col("web_rdp_connection_flag") * 3 + col("developer_tools_flag") * 2).cast(pl.Float64).alias("device_risk_score"),
-        col("event_id").len().over("session_id").alias("session_tx_count"),
-        col("amount_clean").sum().over("session_id").alias("session_amount_sum"),
-        col("channel_indicator_type").n_unique().over("session_id").alias("session_channel_diversity"),
-        col("event_id").count().over(["customer_id", "session_id"]).alias("session_length_estimate"),
+        # Session features: len/sum/n_unique over "session_id" aggregated the FULL
+        # session (including future transactions not yet seen at scoring time).
+        # Replaced with cumulative-within-session expressions that use only
+        # transactions that occurred BEFORE the current one.
+        (col("event_id").cum_count().over(["customer_id", "session_id"]) - 1).alias("session_tx_count"),
+        (col("amount_clean").cum_sum().over(["customer_id", "session_id"]) - col("amount_clean")).fill_null(0).alias("session_amount_sum"),
+        # n_unique over a growing window isn't directly expressible in Polars;
+        # replaced with a binary proxy: did the channel change from the previous
+        # transaction in this session? Same directional fraud signal, no leakage.
+        (col("channel_indicator_type") != col("channel_indicator_type").shift(1).over(["customer_id", "session_id"])).fill_null(False).cast(pl.Int8).alias("session_channel_diversity"),
+        (col("event_id").cum_count().over(["customer_id", "session_id"]) - 1).alias("session_length_estimate"),
     ])
 
     # =========================================================================
@@ -282,24 +308,39 @@ def generate_fraud_features_v4(
             else:
                 # Fallback to Option A for missing keys.
                 lf = lf.with_columns([
-                    col(raw_col).cum_count().over(["customer_id", raw_col]).alias(alias)
+                    (col(raw_col).cum_count().over(["customer_id", raw_col]) - 1).alias(alias)
                 ])
     else:
         # Option A: per-customer cumulative count — no leakage, always usable.
+        # Subtract 1 so the value reflects the count of PRIOR uses (current row
+        # excluded), consistent with the -1 shift applied in Sections B and E.
         lf = lf.with_columns([
-            col(raw_col).cum_count().over(["customer_id", raw_col]).alias(alias)
+            (col(raw_col).cum_count().over(["customer_id", raw_col]) - 1).alias(alias)
             for raw_col, alias, _ in global_col_map
         ])
 
     # Additional temporal features (leakage-free — all use per-customer history)
     lf = lf.with_columns([
-        (col("hour_of_day") - col("hour_of_day").mean().over("customer_id")).abs().alias("circadian_deviation_score"),
+        # circadian_deviation_score: how far is the current hour from the
+        # customer's TYPICAL hour?  The old mean().over("customer_id") used all
+        # transactions including future ones.  Fix: expanding mean of PRIOR hours
+        # = cum_sum shifted by 1 (excludes current row) / tx_count_lifetime
+        # (already the count of prior transactions after the Section B fix).
+        (
+            col("hour_of_day") -
+            col("hour_of_day").cum_sum().over("customer_id").shift(1).fill_null(0) /
+            col("tx_count_lifetime").clip(lower_bound=1)
+        ).abs().alias("circadian_deviation_score"),
         (col("channel_indicator_type") != col("channel_indicator_type").shift(1).over("customer_id")).fill_null(False).cast(pl.Int8).alias("channel_shift_score"),
         when(col("tx_count_1d") > col("avg_tx_per_day_30d") * 2).then(1).otherwise(0).cast(pl.Int8).alias("velocity_change_flag"),
-        col("time_since_last_tx_minutes").std().over("customer_id").fill_null(0).alias("time_gap_variance_30d"),
+        # time_gap_variance_30d: old std().over("customer_id") used the customer's
+        # full all-time history including future transactions.  Fix: rolling_std
+        # over a window of 90 prior gaps (shift(1) excludes the current gap).
+        col("time_since_last_tx_minutes").shift(1).rolling_std(window_size=90, min_periods=2).over("customer_id").fill_null(0).alias("time_gap_variance_30d"),
         col("operating_system_is_new").alias("new_device_flag"),
         col("mcc_is_new_for_user").alias("new_mcc_flag"),
-        (col("channel_indicator_type").cum_count().over(["customer_id", "channel_indicator_type"]) == 1).cast(pl.Int8).alias("new_channel_flag"),
+        # Same -1 shift: 0 prior uses of this channel = new channel for customer.
+        (col("channel_indicator_type").cum_count().over(["customer_id", "channel_indicator_type"]) - 1 == 0).cast(pl.Int8).alias("new_channel_flag"),
         # Merchant entropy: distinct MCCs seen so far / total transactions so far (per customer).
         (col("mcc_freq_user_cum") / col("tx_count_lifetime")).fill_null(0).alias("merchant_entropy_user"),
     ])
@@ -311,30 +352,105 @@ def generate_fraud_features_v4(
     lf = lf.with_columns([
         when((col("is_night") == 1) & (col("new_device_flag") == 1)).then(1).otherwise(0).cast(pl.Int8).alias("new_device_and_night_flag"),
         when((col("web_rdp_connection_flag") == 1) & (col("amount_clean") > 1000)).then(1).otherwise(0).cast(pl.Int8).alias("rdp_and_large_amount_flag"),
-        col("amount_clean").mean().over("channel_indicator_type").alias("amount_zscore_given_channel"),
-        col("amount_clean").mean().over("mcc_code").alias("amount_zscore_given_mcc"),
-        col("amount_clean").mean().over("operating_system_type").alias("amount_zscore_given_device"),
-        col("hour_of_day").std().over("customer_id").alias("tx_time_zscore_given_user"),
+        # amount_zscore_given_channel/mcc/device: old mean().over(category) computed
+        # the global mean across ALL dataset rows for that category, including future
+        # transactions.  Replaced with the customer's own prior mean for each
+        # category (cum_sum - current) / (cum_count - 1), which is leakage-free and
+        # arguably more informative for fraud (personalised baseline vs. global one).
+        # fill_null(0): first encounter of this category for the customer → prior
+        # count = 0, clipped to 1 to avoid div/0, sum = 0, result = 0.
+        (
+            (col("amount_clean").cum_sum().over(["customer_id", "channel_indicator_type"]) - col("amount_clean")) /
+            (col("event_id").cum_count().over(["customer_id", "channel_indicator_type"]) - 1).clip(lower_bound=1)
+        ).fill_null(0).alias("amount_zscore_given_channel"),
+        (
+            (col("amount_clean").cum_sum().over(["customer_id", "mcc_code"]) - col("amount_clean")) /
+            (col("event_id").cum_count().over(["customer_id", "mcc_code"]) - 1).clip(lower_bound=1)
+        ).fill_null(0).alias("amount_zscore_given_mcc"),
+        (
+            (col("amount_clean").cum_sum().over(["customer_id", "operating_system_type"]) - col("amount_clean")) /
+            (col("event_id").cum_count().over(["customer_id", "operating_system_type"]) - 1).clip(lower_bound=1)
+        ).fill_null(0).alias("amount_zscore_given_device"),
+        # tx_time_zscore_given_user: old std().over("customer_id") included future
+        # transactions.  Fix: rolling_std over prior 90 hours (shift(1) excludes
+        # the current row's hour from the window).
+        col("hour_of_day").shift(1).rolling_std(window_size=90, min_periods=2).over("customer_id").fill_null(0).alias("tx_time_zscore_given_user"),
     ])
 
     # ============================================================
     # SECTION G: Channel / MCC Conditional Z-Scores
     # ============================================================
-    lf = lf.with_columns([
-        col("amount_clean").mean().over("channel_indicator_type").alias("channel_mean"),
-        col("amount_clean").std().over("channel_indicator_type").alias("channel_std"),
-        col("amount_clean").mean().over("mcc_code").alias("mcc_mean"),
-        col("amount_clean").std().over("mcc_code").alias("mcc_std"),
-    ])
+    # channel_mean/std and mcc_mean/std: the old mean/std.over(category) computes
+    # the statistic across ALL rows with that category value — including transactions
+    # that happen AFTER the current one.  Fix (two options):
+    #
+    #   Option B (preferred): join precomputed training-set stats passed via
+    #       global_stats["channel_stats_global"] / global_stats["mcc_stats_global"].
+    #       compute_global_stats() now produces these tables.
+    #
+    #   Fallback: customer-level expanding mean/std (only prior rows, no leakage).
+    #       Computed using cumulative sum and sum-of-squares, which give the exact
+    #       sample mean/std for all transactions seen before the current one.
+
+    def _prior_mean_expr(group_cols: list) -> pl.Expr:
+        """Expanding mean of amount_clean for group_cols, excluding the current row."""
+        n = (col("event_id").cum_count().over(group_cols) - 1).clip(lower_bound=1)
+        s = col("amount_clean").cum_sum().over(group_cols) - col("amount_clean")
+        return (s / n).fill_null(0)
+
+    def _prior_std_expr(group_cols: list) -> pl.Expr:
+        """Expanding sample std of amount_clean for group_cols, excluding the current row."""
+        n   = col("event_id").cum_count().over(group_cols) - 1
+        s   = col("amount_clean").cum_sum().over(group_cols) - col("amount_clean")
+        sq  = (col("amount_clean") ** 2).cum_sum().over(group_cols) - col("amount_clean") ** 2
+        # Sample variance: (Σx² − (Σx)²/n) / (n−1)
+        var = (sq - s ** 2 / n.clip(lower_bound=1)) / (n - 1).clip(lower_bound=1)
+        return var.clip(lower_bound=0).sqrt()
+
+    if global_stats and "channel_stats_global" in global_stats and "mcc_stats_global" in global_stats:
+        _ch_sf  = (global_stats["channel_stats_global"].lazy()
+                   if isinstance(global_stats["channel_stats_global"], pl.DataFrame)
+                   else global_stats["channel_stats_global"])
+        _mcc_sf = (global_stats["mcc_stats_global"].lazy()
+                   if isinstance(global_stats["mcc_stats_global"], pl.DataFrame)
+                   else global_stats["mcc_stats_global"])
+        lf = lf.join(_ch_sf,  on="channel_indicator_type", how="left")
+        lf = lf.join(_mcc_sf, on="mcc_code",               how="left")
+    else:
+        lf = lf.with_columns([
+            _prior_mean_expr(["customer_id", "channel_indicator_type"]).alias("channel_mean"),
+            _prior_std_expr( ["customer_id", "channel_indicator_type"]).alias("channel_std"),
+            _prior_mean_expr(["customer_id", "mcc_code"]).alias("mcc_mean"),
+            _prior_std_expr( ["customer_id", "mcc_code"]).alias("mcc_std"),
+        ])
 
     lf = lf.with_columns([
         ((col("amount_clean") - col("channel_mean")) / col("channel_std").fill_null(1)).alias("amount_zscore_channel"),
-        ((col("amount_clean") - col("mcc_mean")) / col("mcc_std").fill_null(1)).alias("amount_zscore_mcc"),
+        ((col("amount_clean") - col("mcc_mean"))     / col("mcc_std").fill_null(1)).alias("amount_zscore_mcc"),
     ])
 
+    # global_combination_freq: the old count().over([channel, os]) scanned ALL
+    # rows in the batch for each (channel, os) pair — leaky.
+    # Option B: join precomputed freq from training data (global_stats["combination_global"]).
+    # Fallback: per-customer cumulative count for this (channel, os) combo.
+    if global_stats and "combination_global" in global_stats:
+        _combo_sf = (global_stats["combination_global"].lazy()
+                     if isinstance(global_stats["combination_global"], pl.DataFrame)
+                     else global_stats["combination_global"])
+        lf = lf.join(_combo_sf, on=["channel_indicator_type", "operating_system_type"], how="left")
+        lf = lf.with_columns(col("global_combination_freq").fill_null(0))
+    else:
+        lf = lf.with_columns(
+            (col("event_id").cum_count().over(["customer_id", "channel_indicator_type", "operating_system_type"]) - 1)
+            .alias("global_combination_freq")
+        )
+
     lf = lf.with_columns([
-        col("event_id").count().over(["channel_indicator_type", "operating_system_type"]).alias("global_combination_freq"),
-        (col("event_id").min().over(["customer_id", "session_id"]) == col("event_id")).cast(pl.Int8).alias("session_first_tx_flag"),
+        # session_first_tx_flag: old min(event_id).over([customer, session]) == event_id
+        # inspected ALL event_ids in the session (including future transactions).
+        # Fix: "is this the first transaction seen so far in this session?" is simply
+        # cum_count within (customer, session) == 1 (first occurrence, no future look).
+        (col("event_id").cum_count().over(["customer_id", "session_id"]) == 1).cast(pl.Int8).alias("session_first_tx_flag"),
         (col("accept_language") != col("accept_language").shift(1).over("customer_id")).cast(pl.Int8).fill_null(0).alias("language_change_flag"),
         (col("operating_system_type") != col("operating_system_type").shift(1).over("customer_id")).cast(pl.Int8).fill_null(0).alias("os_change_flag"),
         (col("timezone") != col("timezone").shift(1).over("customer_id")).cast(pl.Int8).fill_null(0).alias("timezone_change_flag"),
@@ -415,5 +531,33 @@ def compute_global_stats(train_lf: pl.LazyFrame) -> dict[str, pl.LazyFrame]:
             .group_by(raw_col)
             .agg(pl.len().alias(stat_alias))
         )
+
+    # Channel and MCC amount statistics — used by Section G to compute leakage-free
+    # z-scores.  Column names match what the rest of Section G expects so that the
+    # join works without any renaming.
+    stats["channel_stats_global"] = (
+        train_lf
+        .group_by("channel_indicator_type")
+        .agg([
+            col("amount_clean").mean().alias("channel_mean"),
+            col("amount_clean").std().alias("channel_std"),
+        ])
+    )
+    stats["mcc_stats_global"] = (
+        train_lf
+        .group_by("mcc_code")
+        .agg([
+            col("amount_clean").mean().alias("mcc_mean"),
+            col("amount_clean").std().alias("mcc_std"),
+        ])
+    )
+
+    # (channel, OS) combination frequency — used for global_combination_freq /
+    # rare_combination_flag in Section G.
+    stats["combination_global"] = (
+        train_lf
+        .group_by(["channel_indicator_type", "operating_system_type"])
+        .agg(pl.len().alias("global_combination_freq"))
+    )
 
     return stats
