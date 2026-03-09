@@ -111,4 +111,33 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         (col("tx_count_in_channel_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("channel_usage_share"),
     ])
 
+    EPS_CARD = 1e-9
+
+    # ── Card vs P2P spend fractions and cross-window ratios ──────────────────
+    # Captures shifts in the payment type mix: a sudden move to mostly P2P
+    # (or exclusively card) after a stable history is a strong fraud signal.
+    lf = lf.with_columns([
+        # Fraction of window spend that was card vs P2P
+        (col("card_spend_1d")  / (col("cumulative_spend_1d").fill_null(0)  + EPS_CARD)).alias("card_fraction_1d"),
+        (col("p2p_spend_1d")   / (col("cumulative_spend_1d").fill_null(0)  + EPS_CARD)).alias("p2p_fraction_1d"),
+        (col("card_spend_7d")  / (col("cumulative_spend_7d").fill_null(0)  + EPS_CARD)).alias("card_fraction_7d"),
+        (col("card_spend_30d") / (col("cumulative_spend_30d").fill_null(0) + EPS_CARD)).alias("card_fraction_30d"),
+        (col("p2p_spend_30d")  / (col("cumulative_spend_30d").fill_null(0) + EPS_CARD)).alias("p2p_fraction_30d"),
+        (col("card_spend_90d") / (col("cumulative_spend_90d").fill_null(0) + EPS_CARD)).alias("card_fraction_90d"),
+        (col("p2p_spend_90d")  / (col("cumulative_spend_90d").fill_null(0) + EPS_CARD)).alias("p2p_fraction_90d"),
+
+        # Cross-window ratios per payment type
+        (col("card_spend_1d") / (col("card_spend_30d").fill_null(0) + EPS_CARD)).alias("card_spend_ratio_1d_vs_30d"),
+        (col("p2p_spend_1d")  / (col("p2p_spend_30d").fill_null(0)  + EPS_CARD)).alias("p2p_spend_ratio_1d_vs_30d"),
+        (col("card_spend_1d") / (col("card_spend_90d").fill_null(0) + EPS_CARD)).alias("card_spend_ratio_1d_vs_90d"),
+        (col("p2p_spend_1d")  / (col("p2p_spend_90d").fill_null(0)  + EPS_CARD)).alias("p2p_spend_ratio_1d_vs_90d"),
+        (col("card_spend_7d") / (col("card_spend_90d").fill_null(0) + EPS_CARD)).alias("card_spend_ratio_7d_vs_90d"),
+        (col("p2p_spend_7d")  / (col("p2p_spend_90d").fill_null(0)  + EPS_CARD)).alias("p2p_spend_ratio_7d_vs_90d"),
+
+        # Card-to-P2P balance ratio: high value = mostly card, low = mostly P2P
+        (col("card_spend_1d")  / (col("p2p_spend_1d").fill_null(0)  + EPS_CARD)).alias("card_vs_p2p_ratio_1d"),
+        (col("card_spend_30d") / (col("p2p_spend_30d").fill_null(0) + EPS_CARD)).alias("card_vs_p2p_ratio_30d"),
+        (col("card_spend_90d") / (col("p2p_spend_90d").fill_null(0) + EPS_CARD)).alias("card_vs_p2p_ratio_90d"),
+    ])
+
     return lf

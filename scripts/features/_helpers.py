@@ -38,6 +38,10 @@ def get_rolling_stats(base_lf: pl.LazyFrame, period: str, suffix: str) -> pl.Laz
             col("channel_indicator_type").n_unique().alias(f"channel_diversity_{suffix}"),
             col("operating_system_type").n_unique().alias(f"device_diversity_{suffix}"),
             col("mcc_code").n_unique().alias(f"merchant_diversity_{suffix}"),
+            col("amount_card").sum().alias(f"card_spend_{suffix}"),
+            col("amount_p2p").sum().alias(f"p2p_spend_{suffix}"),
+            col("event_desc").n_unique().alias(f"event_desc_diversity_{suffix}"),
+            col("event_type_nm").n_unique().alias(f"event_type_diversity_{suffix}"),
         ])
         .with_row_index("temp_row_idx")
         .select([col("temp_row_idx"), pl.exclude(["customer_id", "event_dttm", "temp_row_idx"])])

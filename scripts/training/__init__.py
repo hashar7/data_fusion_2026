@@ -3,7 +3,7 @@ from scripts.training.train   import train_model
 from scripts.training.evaluate import evaluate
 from scripts.training.predict  import score_test
 from scripts.training.data     import load_labels, build_memmaps
-from scripts.training.config   import LGBM_PARAMS, NON_FEATURE_COLS
+from scripts.training.config   import LGBM_PARAMS, NON_FEATURE_COLS, TX_TYPE_GROUPS, MODEL_OUT_PATHS
 
 __all__ = [
     "train_baseline",
@@ -14,4 +14,6 @@ __all__ = [
     "build_memmaps",
     "LGBM_PARAMS",
     "NON_FEATURE_COLS",
+    "TX_TYPE_GROUPS",
+    "MODEL_OUT_PATHS",
 ]

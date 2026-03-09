@@ -20,28 +20,41 @@ def evaluate(
     y_val: np.ndarray,
     il_val: np.ndarray,
     feature_cols: list,
+    row_mask: np.ndarray | None = None,
     chunk_size: int = 500_000,
+    label: str = "",
 ) -> float:
     """
-    Score the val memmap in chunks and compute PR-AUC.
+    Score the val split and compute PR-AUC on labeled rows.
 
-    PR-AUC is computed only on rows where il_val == 1 (real ground truth).
-    Open-loop rows are scored but excluded from metric computation.
+    row_mask : optional boolean array (len = len(y_val)).
+               When provided, only the subset of rows where row_mask is True
+               is scored and evaluated. Useful for per-group evaluation.
+               Processed via sorted index chunks — never loads the full group
+               into RAM simultaneously.
 
-    Returns the PR-AUC on labeled val rows (competition metric).
+    Returns PR-AUC on labeled rows (competition metric).
     """
-    print("Evaluating on validation set …", flush=True)
-    n_val       = len(y_val)
-    n_chunks    = (n_val + chunk_size - 1) // chunk_size
+    tag = f" [{label}]" if label else ""
+    print(f"Evaluating on validation set{tag} …", flush=True)
+
+    if row_mask is not None:
+        indices = np.where(np.asarray(row_mask))[0]   # sorted
+    else:
+        indices = np.arange(len(y_val))
+
+    n_rows      = len(indices)
+    n_chunks    = max(1, (n_rows + chunk_size - 1) // chunk_size)
     all_scores: list = []
     wall_times: list = []
 
     for i in range(n_chunks):
         t0    = time.perf_counter()
         start = i * chunk_size
-        end   = min(start + chunk_size, n_val)
-        X_chunk = np.array(X_val[start:end])
-        scores  = booster.predict(
+        end   = min(start + chunk_size, n_rows)
+        chunk_idx = indices[start:end]
+        X_chunk   = np.array(X_val[chunk_idx])
+        scores    = booster.predict(
             X_chunk, num_iteration=booster.best_iteration
         ).astype(np.float32)
         all_scores.append(scores)
@@ -53,26 +66,31 @@ def evaluate(
     print(flush=True)
 
     scores_all = np.concatenate(all_scores)
-    labels_all = np.array(y_val)
-    il_all     = np.array(il_val)
+    labels_all = np.asarray(y_val)[indices]
+    il_all     = np.asarray(il_val)[indices]
     del all_scores
     gc.collect()
 
     labeled_mask   = il_all == 1
-    n_labeled      = labeled_mask.sum()
+    n_labeled      = int(labeled_mask.sum())
     n_total        = len(labels_all)
     scores_labeled = scores_all[labeled_mask]
     labels_labeled = labels_all[labeled_mask]
-    print(f"  Scoring {n_labeled:,} labeled rows out of {n_total:,} val rows "
-          f"({n_labeled/n_total:.2%} labeled)", flush=True)
+    print(f"  Scoring {n_labeled:,} labeled rows out of {n_total:,} rows "
+          f"({n_labeled/max(n_total,1):.2%} labeled)", flush=True)
 
-    # ── Competition metric ────────────────────────────────────────────────────
+    if n_labeled == 0:
+        print("  WARNING: no labeled rows — PR-AUC undefined, returning 0.0")
+        return 0.0
+    if labels_labeled.sum() == 0:
+        print("  WARNING: no positives in labeled rows — PR-AUC undefined, returning 0.0")
+        return 0.0
+
     pr_auc     = average_precision_score(labels_labeled, scores_labeled)
     pr_auc_all = average_precision_score(labels_all, scores_all)
     print(f"\n  PR-AUC (labeled only, competition metric) : {pr_auc:.6f}")
-    print(f"  PR-AUC (all val rows incl. open-loop)     : {pr_auc_all:.6f}")
+    print(f"  PR-AUC (all rows incl. open-loop)         : {pr_auc_all:.6f}")
 
-    # ── Max-F1 operating point ────────────────────────────────────────────────
     prec_arr, rec_arr, thresholds = precision_recall_curve(labels_labeled, scores_labeled)
     f1_arr  = np.where(
         (prec_arr + rec_arr) == 0, 0.0,
@@ -100,7 +118,6 @@ def evaluate(
                      (99, "p99"), (100, "max")]:
         print(f"    {lbl:6s}: {np.percentile(scores_labeled, pct):.6f}")
 
-    # ── Feature importance ────────────────────────────────────────────────────
     importance = booster.feature_importance(importance_type="gain")
     feat_imp = (
         pl.DataFrame({"feature": feature_cols, "gain": importance.tolist()})

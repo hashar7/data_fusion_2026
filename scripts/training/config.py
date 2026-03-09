@@ -8,27 +8,21 @@ import os
 LABELS_PATH     = "../../data/train_labels.parquet"
 FEATURES_DIR    = "../data_processed"   # ALL periods in one directory
 STAGING_DIR     = "../data_splits"
-MODEL_OUT_PATH  = "baseline_lgbm.txt"
 SUBMISSION_PATH = "submission.csv"
 
+# Per-group model output paths (keyed by tx_type_group value)
+TX_TYPE_GROUPS  = {0: "nonpayment", 1: "card", 2: "p2p"}
+MODEL_OUT_PATHS = {
+    0: "model_nonpayment.txt",
+    1: "model_card.txt",
+    2: "model_p2p.txt",
+}
+
 # ── Date boundaries ───────────────────────────────────────────────────────────
-# Train period : 2024-10-01 → 2025-05-31  (is_train == 1)
-# Val   window : VAL_CUTOFF_DATE → TRAIN_END_DATE  (is_train == 1)
-# Test  period : 2025-06-01 → 2025-08-09  (is_train == 1)
-#
-# TRAIN_END_DATE is the exclusive upper boundary of the train+val window.
-# Any row with event_dttm >= TRAIN_END_DATE belongs to pretest or test.
 VAL_CUTOFF_DATE = "2025-04-01"
-TRAIN_END_DATE  = "2025-06-01"   # first date of the test period (exclusive)
+TRAIN_END_DATE  = "2025-06-01"
 
 # ── Negative undersampling ────────────────────────────────────────────────────
-# Fraction of TRAINING negatives (label=0) to keep.
-# All positives are always kept.
-#
-# None  → no undersampling; use full dataset (slowest)
-# 0.05  → keep 5% of negatives  → ~1:20  pos:neg ratio  (recommended start)
-# 0.02  → keep 2% of negatives  → ~1:8   pos:neg ratio  (fast iteration)
-# 0.10  → more negative diversity; slower but less likely to miss neg patterns
 NEG_SAMPLE_RATIO = 0.05
 UNDERSAMPLE_SEED = 42
 
@@ -41,21 +35,17 @@ NON_FEATURE_COLS = {
 }
 
 # ── LightGBM hyper-parameters ─────────────────────────────────────────────────
-# is_unbalance is set dynamically in train.py depending on NEG_SAMPLE_RATIO.
 LGBM_PARAMS = {
     "objective":         "binary",
     "metric":            "average_precision",
     "verbosity":         -1,
     "device_type":       "cpu",
     "num_threads":       max(1, (os.cpu_count() or 4) - 1),
-    # ── Tree structure ────────────────────────────────────────────────────────
     "num_leaves":        127,
     "max_depth":         -1,
     "min_child_samples": 200,
-    # ── Learning rate & iterations ────────────────────────────────────────────
     "learning_rate":     0.005,
     "n_estimators":      3000,
-    # ── Memory / speed ────────────────────────────────────────────────────────
     "max_bin":           255,
     "subsample":         0.8,
     "subsample_freq":    1,

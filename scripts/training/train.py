@@ -19,52 +19,72 @@ def train_model(
     y_val: np.ndarray,
     il_val: np.ndarray,
     feature_cols: list,
+    train_row_mask: np.ndarray | None = None,
 ) -> lgb.Booster:
     """
-    Build LightGBM Datasets from memmap arrays and train.
+    Train a LightGBM binary classifier.
 
-    X_train / y_train : full train split (labeled + open-loop rows, label=0)
-    X_val / y_val     : full val split   (labeled + open-loop rows, label=0)
-    il_val            : int8 mask — 1 = this val row has a real label
-
-    Early stopping uses ONLY labeled val rows (il_val == 1) so that the
-    average_precision metric tracked during training is not diluted by the
-    millions of open-loop rows assigned a synthetic label=0.
+    X_train / y_train : full train split memmaps (or any array).
+    X_val / y_val     : val rows used for early stopping.
+                        If il_val is all-ones, all rows are labeled.
+    il_val            : int8 mask — 1 = row has a real label.
+    train_row_mask    : optional boolean array (len = len(y_train)).
+                        When provided, only rows where mask is True are used
+                        for training. Group filtering + undersampling are
+                        applied jointly so only the final sample is loaded
+                        into RAM from the memmap.
     """
     rng = np.random.default_rng(UNDERSAMPLE_SEED)
-    y_train_arr = np.array(y_train)
-    pos_idx = np.where(y_train_arr == 1)[0]
-    neg_idx = np.where(y_train_arr == 0)[0]
+
+    # ── Select group rows (or all rows) ──────────────────────────────────────
+    # y is always small (Int8), so loading it for the full train split is fine.
+    y_full = np.asarray(y_train)
+    if train_row_mask is not None:
+        # group_global_idx: global indices of rows in this group (sorted)
+        group_global_idx = np.where(np.asarray(train_row_mask))[0]
+        y_group = y_full[group_global_idx]
+    else:
+        group_global_idx = None
+        y_group = y_full
+
+    pos_local = np.where(y_group == 1)[0]
+    neg_local = np.where(y_group == 0)[0]
 
     if NEG_SAMPLE_RATIO is not None:
-        n_neg_keep      = max(int(len(neg_idx) * NEG_SAMPLE_RATIO), len(pos_idx))
-        neg_idx_sampled = rng.choice(neg_idx, size=n_neg_keep, replace=False)
-        neg_idx_sampled.sort()   # sorted → sequential memmap reads (faster)
-        train_idx = np.sort(np.concatenate([pos_idx, neg_idx_sampled]))
+        n_neg_keep = max(int(len(neg_local) * NEG_SAMPLE_RATIO), len(pos_local))
+        neg_sampled = rng.choice(neg_local, size=n_neg_keep, replace=False)
+        neg_sampled.sort()
+        sample_local = np.sort(np.concatenate([pos_local, neg_sampled]))
 
-        n_pos  = len(pos_idx)
-        n_neg  = len(neg_idx_sampled)
+        n_pos = len(pos_local)
+        n_neg = len(neg_sampled)
         print(f"  Undersampling: kept {n_pos:,} pos + {n_neg:,} neg "
               f"(1:{n_neg/max(n_pos,1):.0f} ratio, "
-              f"{len(train_idx):,} / {len(y_train_arr):,} total rows)", flush=True)
-
-        # Class ratio already corrected by undersampling — is_unbalance would
-        # double-correct and make the model over-aggressive.
+              f"{len(sample_local):,} total rows)", flush=True)
         params = {**LGBM_PARAMS, "is_unbalance": False}
-        X_train_used = np.array(X_train[train_idx])
-        y_train_used = y_train_arr[train_idx]
     else:
-        print(f"  No undersampling — using full {len(y_train_arr):,} train rows",
-              flush=True)
+        sample_local = np.arange(len(y_group))
+        print(f"  No undersampling — using {len(y_group):,} rows", flush=True)
         params = {**LGBM_PARAMS, "is_unbalance": True}
-        X_train_used = X_train
-        y_train_used = y_train_arr
 
-    del y_train_arr, pos_idx, neg_idx
+    # Map local indices back to global X_train indices
+    if group_global_idx is not None:
+        sample_global = group_global_idx[sample_local]
+        sample_global.sort()   # sequential memmap reads
+    else:
+        sample_global = sample_local
+
+    # Load only the final sampled subset into RAM
+    X_train_used = np.array(X_train[sample_global])
+    y_train_used = y_group[sample_local]
+
+    del y_full, y_group, pos_local, neg_local, sample_local, sample_global
+    if group_global_idx is not None:
+        del group_global_idx
     gc.collect()
 
-    # Early stopping: labeled val rows only
-    labeled_mask  = np.array(il_val) == 1
+    # ── Labeled val rows for early stopping ───────────────────────────────────
+    labeled_mask  = np.asarray(il_val) == 1
     X_val_labeled = np.array(X_val[labeled_mask])
     y_val_labeled = np.array(y_val[labeled_mask])
     print(f"  Labeled val rows for early stopping: {labeled_mask.sum():,} / {len(il_val):,}\n",

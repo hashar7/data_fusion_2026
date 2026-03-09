@@ -1,4 +1,4 @@
-"""Score the test set and write a submission CSV."""
+"""Score the test set using per-group models and write a submission CSV."""
 import gc
 import time
 from datetime import datetime
@@ -7,38 +7,41 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from scripts.training.config import FEATURES_DIR, TRAIN_END_DATE
+from scripts.training.config import FEATURES_DIR, TRAIN_END_DATE, TX_TYPE_GROUPS
 from scripts.training._utils import _parquet_files, _progress
 
 
 def score_test(
-    booster: lgb.Booster,
+    boosters: dict,
     feature_cols: list,
     submission_path: str,
     chunk_size: int = 500_000,
 ) -> None:
     """
-    Score test rows from FEATURES_DIR and write a submission CSV.
+    Score test rows using per-group LightGBM models and write a submission CSV.
 
-    Test rows are identified by:  is_train == 1  AND  event_dttm >= TRAIN_END_DATE
-    Pretest rows (is_train == 0, same date range) are skipped — they were only
-    needed as historical context during feature engineering.
+    boosters       : dict mapping tx_type_group (int) → lgb.Booster.
+    feature_cols   : list of feature column names (same for all models).
 
-    Output: CSV with columns [event_id, predict] (raw probability in [0, 1]).
-    Memory: one parquet file in RAM at a time.
+    Test rows: is_train == 1  AND  event_dttm >= TRAIN_END_DATE.
+    Each row is routed to the model whose key matches its tx_type_group value.
     """
     test_files = _parquet_files(FEATURES_DIR)
     if not test_files:
         raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
 
     train_end = datetime.fromisoformat(TRAIN_END_DATE)
+    group_names = {g: TX_TYPE_GROUPS.get(g, str(g)) for g in boosters}
     print(f"\nScoring test set from {FEATURES_DIR!r} "
           f"({len(test_files)} partitions) …", flush=True)
+    print(f"  Models active: { {g: group_names[g] for g in sorted(boosters)} }\n",
+          flush=True)
 
     all_event_ids: list = []
     all_scores:    list = []
     wall_times:    list = []
     total_test_rows = 0
+    group_counts: dict = {g: 0 for g in boosters}
 
     for i, f in enumerate(test_files):
         t0 = time.perf_counter()
@@ -62,30 +65,43 @@ def score_test(
             continue
 
         event_ids = test_chunk["event_id"].to_numpy()
+        tg_arr    = test_chunk["tx_type_group"].to_numpy().astype(np.int8)
+        scores    = np.full(len(test_chunk), 0.0, dtype=np.float32)
 
-        n = len(test_chunk)
-        chunk_scores: list = []
-        for start in range(0, n, chunk_size):
-            end   = min(start + chunk_size, n)
-            X_sub = (
-                test_chunk[start:end]
-                .select(feature_cols)
-                .to_numpy(allow_copy=True)
-                .astype(np.float32)
-            )
-            s = booster.predict(
-                X_sub, num_iteration=booster.best_iteration
-            ).astype(np.float32)
-            chunk_scores.append(s)
-            del X_sub
-            gc.collect()
+        for group_id, booster in boosters.items():
+            group_mask = tg_arr == group_id
+            if not group_mask.any():
+                continue
+            group_local_idx = np.where(group_mask)[0]
 
-        scores = np.concatenate(chunk_scores)
+            # Score in sub-chunks to limit RAM
+            chunk_scores_parts: list = []
+            for cs in range(0, len(group_local_idx), chunk_size):
+                ce     = min(cs + chunk_size, len(group_local_idx))
+                sub_idx = group_local_idx[cs:ce]
+                X_sub   = (
+                    test_chunk[sub_idx.tolist()]
+                    .select(feature_cols)
+                    .to_numpy(allow_copy=True)
+                    .astype(np.float32)
+                )
+                s = booster.predict(
+                    X_sub, num_iteration=booster.best_iteration
+                ).astype(np.float32)
+                chunk_scores_parts.append(s)
+                del X_sub
+                gc.collect()
+
+            group_scores = np.concatenate(chunk_scores_parts)
+            scores[group_local_idx] = group_scores
+            group_counts[group_id] += int(group_mask.sum())
+            del group_scores, chunk_scores_parts
+
         all_event_ids.append(event_ids)
         all_scores.append(scores)
-        total_test_rows += n
+        total_test_rows += len(test_chunk)
 
-        del test_chunk, chunk_scores, scores, event_ids
+        del test_chunk, scores, event_ids, tg_arr
         gc.collect()
 
         wall_times.append(time.perf_counter() - t0)
@@ -96,10 +112,8 @@ def score_test(
 
     if total_test_rows == 0:
         raise RuntimeError(
-            f"No test rows (is_train==1 AND event_dttm >= {TRAIN_END_DATE}) "
-            f"found in {FEATURES_DIR!r}. "
-            "Check TRAIN_END_DATE and that parquet files contain "
-            "is_train and event_dttm columns."
+            f"No test rows found in {FEATURES_DIR!r}. "
+            "Check TRAIN_END_DATE and parquet files."
         )
 
     event_ids_all = np.concatenate(all_event_ids)
@@ -114,12 +128,14 @@ def score_test(
 
     n_dupes = len(submission) - submission["event_id"].n_unique()
     if n_dupes > 0:
-        print(f"  WARNING: {n_dupes:,} duplicate event_ids in submission — "
-              "check if test and pretest partitions overlap.", flush=True)
+        print(f"  WARNING: {n_dupes:,} duplicate event_ids in submission.", flush=True)
 
     submission.write_csv(submission_path)
 
     print(f"  Test rows scored   : {total_test_rows:,}")
+    for g, name in TX_TYPE_GROUPS.items():
+        if g in group_counts:
+            print(f"    {name:12s} : {group_counts[g]:,} rows")
     print(f"  Submission written : {submission_path}")
     print("  Score distribution :")
     for pct, lbl in [(0, "min"), (25, "p25"), (50, "median"),

@@ -58,4 +58,24 @@ def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         ),
     ])
 
+    # ── Transaction type grouping ─────────────────────────────────────────────
+    # 0 = non-payment (no amount), 1 = card (has amount + MCC), 2 = P2P (has amount, no MCC)
+    lf = lf.with_columns([
+        when(col("operaton_amt").is_null())
+        .then(lit(0))
+        .when(col("mcc_code").is_not_null() & (col("mcc_code") != ""))
+        .then(lit(1))
+        .otherwise(lit(2))
+        .cast(pl.Int8)
+        .alias("tx_type_group"),
+    ])
+
+    # Masked amounts for rolling aggregation by transaction type.
+    # amount_card / amount_p2p contribute their amount in the relevant window sums;
+    # the other type contributes 0, so window sums give per-type spending directly.
+    lf = lf.with_columns([
+        when(col("tx_type_group") == 1).then(col("amount_clean")).otherwise(lit(0.0)).alias("amount_card"),
+        when(col("tx_type_group") == 2).then(col("amount_clean")).otherwise(lit(0.0)).alias("amount_p2p"),
+    ])
+
     return lf

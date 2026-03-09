@@ -67,4 +67,48 @@ def compute_global_stats(train_lf: pl.LazyFrame) -> dict[str, pl.LazyFrame]:
         .agg(pl.len().alias("global_combination_freq"))
     )
 
+    # ── Per-category amount distribution statistics ────────────────────────────
+    # Used by category_stats.py to compute global (population-level) z-scores.
+    stats["event_desc_stats_global"] = (
+        train_lf
+        .group_by("event_desc")
+        .agg([
+            col("amount_clean").mean().alias("event_desc_global_mean"),
+            col("amount_clean").std().alias("event_desc_global_std"),
+        ])
+    )
+
+    stats["event_type_stats_global"] = (
+        train_lf
+        .group_by("event_type_nm")
+        .agg([
+            col("amount_clean").mean().alias("event_type_global_mean"),
+            col("amount_clean").std().alias("event_type_global_std"),
+        ])
+    )
+
+    stats["subchannel_stats_global"] = (
+        train_lf
+        .group_by("channel_indicator_sub_type")
+        .agg([
+            col("amount_clean").mean().alias("subchannel_global_mean"),
+            col("amount_clean").std().alias("subchannel_global_std"),
+        ])
+    )
+
+    stats["pos_stats_global"] = (
+        train_lf
+        .group_by("pos_cd")
+        .agg([
+            col("amount_clean").mean().alias("pos_global_mean"),
+            col("amount_clean").std().alias("pos_global_std"),
+        ])
+    )
+
+    stats["subchannel_global"] = (
+        train_lf
+        .group_by("channel_indicator_sub_type")
+        .agg(pl.len().alias("global_subchannel_freq"))
+    )
+
     return stats
