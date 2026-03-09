@@ -47,10 +47,21 @@ def add_temporal_features(
         (col("channel_indicator_type") != col("channel_indicator_type").shift(1).over("customer_id")).fill_null(False).cast(pl.Int8).alias("channel_shift_score"),
         when(col("tx_count_1d") > col("avg_tx_per_day_30d") * 2).then(1).otherwise(0).cast(pl.Int8).alias("velocity_change_flag"),
         col("time_since_last_tx_minutes").shift(1).rolling_std(window_size=90, min_periods=2).over("customer_id").fill_null(0).alias("time_gap_variance_30d"),
+        col("time_since_last_tx_minutes").shift(1).rolling_mean(window_size=90, min_periods=2).over("customer_id").fill_null(0).alias("time_gap_mean_30d"),
+        # Minimum gap in last 10 transactions: catches short burst sequences more
+        # precisely than burst_flag (which only looks at the immediately preceding gap)
+        col("time_since_last_tx_minutes").shift(1).rolling_min(window_size=10, min_periods=1).over("customer_id").fill_null(0).alias("time_gap_min_10tx"),
         col("operating_system_is_new").alias("new_device_flag"),
         col("mcc_is_new_for_user").alias("new_mcc_flag"),
         (col("channel_indicator_type").cum_count().over(["customer_id", "channel_indicator_type"]) - 1 == 0).cast(pl.Int8).alias("new_channel_flag"),
         (col("mcc_freq_user_cum") / col("tx_count_lifetime")).fill_null(0).alias("merchant_entropy_user"),
+    ])
+
+    # Coefficient of variation of inter-transaction gaps: std / mean.
+    # Scale-free — a customer who transacts every 5 minutes normally has the same
+    # CV as one who transacts daily, so it captures *relative* irregularity.
+    lf = lf.with_columns([
+        (col("time_gap_variance_30d") / (col("time_gap_mean_30d") + 1e-9)).alias("time_gap_cv_30d"),
     ])
 
     lf = lf.with_columns([

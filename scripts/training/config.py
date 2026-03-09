@@ -53,7 +53,7 @@ LGBM_PARAMS = {
     "max_depth":         -1,
     "min_child_samples": 200,
     # ── Learning rate & iterations ────────────────────────────────────────────
-    "learning_rate":     0.05,
+    "learning_rate":     0.005,
     "n_estimators":      3000,
     # ── Memory / speed ────────────────────────────────────────────────────────
     "max_bin":           255,
@@ -65,5 +65,5 @@ LGBM_PARAMS = {
     "seed":              42,
 }
 
-EARLY_STOPPING_ROUNDS = 100
+EARLY_STOPPING_ROUNDS = 150
 LOG_EVAL_PERIOD       = 50

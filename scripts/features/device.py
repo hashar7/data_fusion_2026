@@ -29,6 +29,27 @@ def add_device_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         (col("amount_clean").cum_sum().over(["customer_id", "session_id"]) - col("amount_clean")).fill_null(0).alias("session_amount_sum"),
         (col("channel_indicator_type") != col("channel_indicator_type").shift(1).over(["customer_id", "session_id"])).fill_null(False).cast(pl.Int8).alias("session_channel_diversity"),
         (col("event_id").cum_count().over(["customer_id", "session_id"]) - 1).alias("session_length_estimate"),
+        # MCC switch within a session: jumping merchants in one session is suspicious
+        (col("mcc_code") != col("mcc_code").shift(1).over(["customer_id", "session_id"])).fill_null(False).cast(pl.Int8).alias("session_mcc_switch"),
+        # Session duration: minutes elapsed since the first transaction in this session.
+        # cum_min on sorted data equals the session-start timestamp — leakage-free.
+        (col("event_dttm") - col("event_dttm").cum_min().over(["customer_id", "session_id"])).dt.total_minutes().fill_null(0).alias("session_duration_minutes"),
+    ])
+
+    # Features that depend on session_tx_count / session_amount_sum computed above.
+    # Continuous device×amount interactions replace the weak binary composite flags:
+    # binary flags (new_device_and_night etc.) don't appear in top-60; continuous
+    # products give the model a smooth signal to split on.
+    lf = lf.with_columns([
+        # Average spend per transaction so far in this session
+        (col("session_amount_sum") / col("session_tx_count").clip(lower_bound=1)).fill_null(0).alias("session_avg_amount"),
+        # Compromised device × how many times larger than 30d mean this transaction is
+        (
+            col("compromised_flag").cast(pl.Float64) *
+            col("amount_clean") / (col("amount_mean_30d").fill_null(1) + 1e-9)
+        ).alias("compromised_x_amount_ratio"),
+        # RDP session depth: remote-controlled device × how deep into the session we are
+        (col("web_rdp_connection_flag").cast(pl.Float64) * col("session_tx_count").cast(pl.Float64)).alias("rdp_x_session_depth"),
     ])
 
     return lf
