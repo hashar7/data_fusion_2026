@@ -131,6 +131,11 @@ def add_category_stats_features(
         .fill_null(0)
         .alias("subchannel_usage_share"),
 
+        # Log count complement to the linear tx_count_in_subchannel_lifetime.
+        # Competitor's channel_indicator_sub_type_log_count ranks 22nd (1.27% gain).
+        col("tx_count_in_subchannel_lifetime").cast(pl.Float32).log1p()
+        .alias("channel_indicator_sub_type_log_count"),
+
         (col("tx_count_in_subchannel_lifetime") == 0)
         .cast(pl.Int8)
         .alias("is_new_subchannel_for_user"),
@@ -308,5 +313,77 @@ def add_category_stats_features(
 
     # Drop intermediate helper columns
     lf = lf.drop(["_prior_lifetime_spend"])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # I. Bayesian-smoothed target encodings
+    #    Precomputed on the labeled training set in global_stats.py.
+    #    Each feature is the smoothed fraud rate for that category value.
+    #    Unseen values at test time are filled with the stored global rate.
+    # ══════════════════════════════════════════════════════════════════════════
+    _SINGLE_TE = [
+        # (stats key,                join column,                  feature name)
+        ("evtype_target_enc",        "event_type_nm",              "event_type_nm_target_enc"),
+        ("evdesc_target_enc",        "event_desc",                 "event_desc_target_enc"),
+        ("channel_type_target_enc",  "channel_indicator_type",     "channel_type_target_enc"),
+        ("channel_subtype_target_enc","channel_indicator_sub_type","channel_subtype_target_enc"),
+        # MCC fraud rate — strong signal for card transactions; fills with global rate for non-card (null mcc_code)
+        ("mcc_target_enc",           "mcc_code",                   "mcc_target_enc"),
+    ]
+
+    if global_stats:
+        # Retrieve the global fraud rate (fallback for unseen category values).
+        _fallback = 0.5  # neutral prior when global_fraud_rate key is missing
+        if "global_fraud_rate" in global_stats:
+            _gfr_df = _to_lazy(global_stats["global_fraud_rate"]).collect()
+            _fallback = float(_gfr_df["global_fraud_rate"][0])
+
+        for key, join_col, feat_name in _SINGLE_TE:
+            if key in global_stats:
+                lf = lf.join(
+                    _to_lazy(global_stats[key]),
+                    on=join_col,
+                    how="left",
+                ).with_columns(
+                    pl.col(feat_name).fill_null(_fallback)
+                )
+            else:
+                lf = lf.with_columns(pl.lit(_fallback).alias(feat_name))
+
+        if "type_desc_target_enc" in global_stats:
+            lf = lf.join(
+                _to_lazy(global_stats["type_desc_target_enc"]),
+                on=["event_type_nm", "event_desc"],
+                how="left",
+            ).with_columns(
+                pl.col("type_desc_pair_target_enc").fill_null(_fallback)
+            )
+        else:
+            lf = lf.with_columns(pl.lit(_fallback).alias("type_desc_pair_target_enc"))
+
+        # Within-group channel encodings — two-column join key
+        _WITHIN_GROUP_TE = [
+            # (stats key,                    join columns,                                          feature name)
+            ("channel_type_within_group_te",    ["tx_type_group", "channel_indicator_type"],     "channel_type_fraud_rate_within_group"),
+            ("channel_subtype_within_group_te", ["tx_type_group", "channel_indicator_sub_type"], "channel_subtype_fraud_rate_within_group"),
+        ]
+        for key, join_cols, feat_name in _WITHIN_GROUP_TE:
+            if key in global_stats:
+                lf = lf.join(
+                    _to_lazy(global_stats[key]),
+                    on=join_cols,
+                    how="left",
+                ).with_columns(
+                    pl.col(feat_name).fill_null(_fallback)
+                )
+            else:
+                lf = lf.with_columns(pl.lit(_fallback).alias(feat_name))
+    else:
+        # No global_stats at all: emit neutral constant so the schema is stable
+        for _, _, feat_name in _SINGLE_TE:
+            lf = lf.with_columns(pl.lit(0.5).alias(feat_name))
+        lf = lf.with_columns(pl.lit(0.5).alias("type_desc_pair_target_enc"))
+        lf = lf.with_columns(pl.lit(0.5).alias("channel_type_fraud_rate_within_group"))
+        lf = lf.with_columns(pl.lit(0.5).alias("channel_subtype_fraud_rate_within_group"))
+        lf = lf.with_columns(pl.lit(0.5).alias("mcc_target_enc"))
 
     return lf

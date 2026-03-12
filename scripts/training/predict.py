@@ -1,47 +1,54 @@
-"""Score the test set using per-group models and write a submission CSV."""
+"""Score the test set using per-group ensembles and write a submission CSV."""
 import gc
 import time
 from datetime import datetime
 
-import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from scripts.training.config import FEATURES_DIR, TRAIN_END_DATE, TX_TYPE_GROUPS
+from scripts.training.config import (
+    FEATURES_DIR, TRAIN_END_DATE, TX_TYPE_GROUPS, CATBOOST_BLEND_WEIGHT,
+)
 from scripts.training._utils import _parquet_files, _progress
 
 
 def score_test(
-    boosters: dict,
+    lgbm_boosters: dict,
+    catboost_models: dict,
     feature_cols: list,
     submission_path: str,
     chunk_size: int = 500_000,
 ) -> None:
     """
-    Score test rows using per-group LightGBM models and write a submission CSV.
+    Score test rows using per-group ensembles and write a submission CSV.
 
-    boosters       : dict mapping tx_type_group (int) → lgb.Booster.
-    feature_cols   : list of feature column names (same for all models).
+    lgbm_boosters  : dict[group_id → list[lgb.Booster]]  (multi-seed)
+    catboost_models: dict[group_id → CatBoostClassifier | None]
+    feature_cols   : list of feature column names (same order for all models).
 
     Test rows: is_train == 1  AND  event_dttm >= TRAIN_END_DATE.
-    Each row is routed to the model whose key matches its tx_type_group value.
+    Each row is routed to the ensemble whose key matches its model_group value.
+    Scoring pipeline per row:
+        1. Average LGBM predictions across seeds
+        2. Blend with CatBoost (CATBOOST_BLEND_WEIGHT)
     """
     test_files = _parquet_files(FEATURES_DIR)
     if not test_files:
         raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
 
-    train_end = datetime.fromisoformat(TRAIN_END_DATE)
-    group_names = {g: TX_TYPE_GROUPS.get(g, str(g)) for g in boosters}
+    train_end   = datetime.fromisoformat(TRAIN_END_DATE)
+    n_seeds     = {g: len(v) for g, v in lgbm_boosters.items()}
+    group_names = {g: TX_TYPE_GROUPS.get(g, str(g)) for g in lgbm_boosters}
     print(f"\nScoring test set from {FEATURES_DIR!r} "
           f"({len(test_files)} partitions) …", flush=True)
-    print(f"  Models active: { {g: group_names[g] for g in sorted(boosters)} }\n",
-          flush=True)
+    print(f"  LightGBM seeds  : {n_seeds}")
+    print(f"  CatBoost weight : {CATBOOST_BLEND_WEIGHT}\n", flush=True)
 
     all_event_ids: list = []
     all_scores:    list = []
     wall_times:    list = []
     total_test_rows = 0
-    group_counts: dict = {g: 0 for g in boosters}
+    group_counts: dict = {g: 0 for g in lgbm_boosters}
 
     for i, f in enumerate(test_files):
         t0 = time.perf_counter()
@@ -65,19 +72,20 @@ def score_test(
             continue
 
         event_ids = test_chunk["event_id"].to_numpy()
-        tg_arr    = test_chunk["tx_type_group"].to_numpy().astype(np.int8)
-        scores    = np.full(len(test_chunk), 0.0, dtype=np.float32)
+        tg_arr    = test_chunk["model_group"].to_numpy().astype(np.int8)
+        scores    = np.zeros(len(test_chunk), dtype=np.float32)
 
-        for group_id, booster in boosters.items():
+        for group_id, boosters in lgbm_boosters.items():
             group_mask = tg_arr == group_id
             if not group_mask.any():
                 continue
             group_local_idx = np.where(group_mask)[0]
+            cb_model        = catboost_models.get(group_id)
 
             # Score in sub-chunks to limit RAM
-            chunk_scores_parts: list = []
+            group_scores_parts: list = []
             for cs in range(0, len(group_local_idx), chunk_size):
-                ce     = min(cs + chunk_size, len(group_local_idx))
+                ce      = min(cs + chunk_size, len(group_local_idx))
                 sub_idx = group_local_idx[cs:ce]
                 X_sub   = (
                     test_chunk[sub_idx.tolist()]
@@ -85,17 +93,34 @@ def score_test(
                     .to_numpy(allow_copy=True)
                     .astype(np.float32)
                 )
-                s = booster.predict(
-                    X_sub, num_iteration=booster.best_iteration
-                ).astype(np.float32)
-                chunk_scores_parts.append(s)
-                del X_sub
+
+                # Average LGBM predictions across seeds
+                lgbm_sum = np.zeros(len(sub_idx), dtype=np.float64)
+                for booster in boosters:
+                    lgbm_sum += booster.predict(
+                        X_sub, num_iteration=booster.best_iteration
+                    ).astype(np.float64)
+                lgbm_avg = (lgbm_sum / len(boosters)).astype(np.float32)
+
+                # Blend with CatBoost
+                if cb_model is not None:
+                    w    = CATBOOST_BLEND_WEIGHT
+                    cb_s = cb_model.predict_proba(X_sub)[:, 1].astype(np.float32)
+                    blended = (lgbm_avg * (1.0 - w) + cb_s * w).astype(np.float32)
+                    del cb_s
+                else:
+                    blended = lgbm_avg
+
+                group_scores_parts.append(blended)
+                del X_sub, lgbm_sum, lgbm_avg, blended
                 gc.collect()
 
-            group_scores = np.concatenate(chunk_scores_parts)
+            group_scores = np.concatenate(group_scores_parts)
+            del group_scores_parts
             scores[group_local_idx] = group_scores
             group_counts[group_id] += int(group_mask.sum())
-            del group_scores, chunk_scores_parts
+            del group_scores
+            gc.collect()
 
         all_event_ids.append(event_ids)
         all_scores.append(scores)

@@ -5,6 +5,8 @@ from scripts.features.rolling      import add_rolling_features
 from scripts.features.device       import add_device_features
 from scripts.features.temporal     import add_temporal_features
 from scripts.features.zscore       import add_zscore_features
+from scripts.features.category_stats import add_category_stats_features
+from scripts.features.category_risk  import add_category_risk_features
 from scripts.features.global_stats import compute_global_stats  # re-exported for callers
 
 _COLS_TO_DROP = ["temp_row_idx", "amount_clean", "channel_mean", "channel_std", "mcc_mean", "mcc_std"]
@@ -21,6 +23,8 @@ def generate_fraud_features(
     lf = add_device_features(lf)
     lf = add_temporal_features(lf, global_stats)
     lf = add_zscore_features(lf, global_stats)
+    lf = add_category_stats_features(lf, global_stats)
+    lf = add_category_risk_features(lf)
     return lf.drop(_COLS_TO_DROP)
 
 

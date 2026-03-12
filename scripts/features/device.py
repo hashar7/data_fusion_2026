@@ -34,6 +34,18 @@ def add_device_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         # Session duration: minutes elapsed since the first transaction in this session.
         # cum_min on sorted data equals the session-start timestamp — leakage-free.
         (col("event_dttm") - col("event_dttm").cum_min().over(["customer_id", "session_id"])).dt.total_minutes().fill_null(0).alias("session_duration_minutes"),
+        # Gap in seconds between consecutive transactions in the SAME session.
+        # Captures burst behavior within a session that session_duration_minutes misses.
+        # Competitor's pause_ses — different from pause_cus (customer-level gap).
+        (col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "session_id"])).dt.total_seconds().fill_null(0).alias("pause_ses"),
+    ])
+
+    # Screen dimensions parsed from "WxH" string (e.g. "1080x1920").
+    # screen_size_is_new is a binary first-occurrence flag; the actual dimensions
+    # carry a different signal (unusual screen resolution for this user/device type).
+    lf = lf.with_columns([
+        col("screen_size").str.extract(r"^(\d+)", 1).cast(pl.Int32).fill_null(0).alias("screen_w"),
+        col("screen_size").str.extract(r"x(\d+)", 1).cast(pl.Int32).fill_null(0).alias("screen_h"),
     ])
 
     # Features that depend on session_tx_count / session_amount_sum computed above.

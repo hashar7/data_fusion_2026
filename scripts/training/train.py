@@ -20,6 +20,10 @@ def train_model(
     il_val: np.ndarray,
     feature_cols: list,
     train_row_mask: np.ndarray | None = None,
+    neg_sample_ratio: float | None = None,
+    lgbm_params: dict | None = None,
+    early_stopping_rounds: int | None = None,
+    seed_override: int | None = None,
 ) -> lgb.Booster:
     """
     Train a LightGBM binary classifier.
@@ -34,7 +38,11 @@ def train_model(
                         applied jointly so only the final sample is loaded
                         into RAM from the memmap.
     """
-    rng = np.random.default_rng(UNDERSAMPLE_SEED)
+    rng = np.random.default_rng(seed_override if seed_override is not None else UNDERSAMPLE_SEED)
+    if neg_sample_ratio is None:
+        neg_sample_ratio = NEG_SAMPLE_RATIO
+    base_params = lgbm_params if lgbm_params is not None else LGBM_PARAMS
+    es_rounds   = early_stopping_rounds if early_stopping_rounds is not None else EARLY_STOPPING_ROUNDS
 
     # ── Select group rows (or all rows) ──────────────────────────────────────
     # y is always small (Int8), so loading it for the full train split is fine.
@@ -50,8 +58,8 @@ def train_model(
     pos_local = np.where(y_group == 1)[0]
     neg_local = np.where(y_group == 0)[0]
 
-    if NEG_SAMPLE_RATIO is not None:
-        n_neg_keep = max(int(len(neg_local) * NEG_SAMPLE_RATIO), len(pos_local))
+    if neg_sample_ratio is not None:
+        n_neg_keep = max(int(len(neg_local) * neg_sample_ratio), len(pos_local))
         neg_sampled = rng.choice(neg_local, size=n_neg_keep, replace=False)
         neg_sampled.sort()
         sample_local = np.sort(np.concatenate([pos_local, neg_sampled]))
@@ -61,11 +69,15 @@ def train_model(
         print(f"  Undersampling: kept {n_pos:,} pos + {n_neg:,} neg "
               f"(1:{n_neg/max(n_pos,1):.0f} ratio, "
               f"{len(sample_local):,} total rows)", flush=True)
-        params = {**LGBM_PARAMS, "is_unbalance": False}
+        params = {**base_params, "is_unbalance": False}
     else:
         sample_local = np.arange(len(y_group))
         print(f"  No undersampling — using {len(y_group):,} rows", flush=True)
-        params = {**LGBM_PARAMS, "is_unbalance": True}
+        params = {**base_params, "is_unbalance": True}
+
+    # Override random seed for ensemble diversity
+    if seed_override is not None:
+        params = {**params, "seed": seed_override}
 
     # Map local indices back to global X_train indices
     if group_global_idx is not None:
@@ -97,7 +109,7 @@ def train_model(
         print(f"  {k:25s}: {v}")
     print(flush=True)
 
-    free_train = NEG_SAMPLE_RATIO is not None
+    free_train = neg_sample_ratio is not None
     dtrain = lgb.Dataset(
         X_train_used, label=y_train_used,
         feature_name=feature_cols,
@@ -118,11 +130,11 @@ def train_model(
     booster = lgb.train(
         params=params,
         train_set=dtrain,
-        num_boost_round=LGBM_PARAMS["n_estimators"],
+        num_boost_round=base_params.get("n_estimators", LGBM_PARAMS["n_estimators"]),
         valid_sets=[dval],
         valid_names=["val"],
         callbacks=[
-            lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=True),
+            lgb.early_stopping(stopping_rounds=es_rounds, verbose=True),
             lgb.log_evaluation(period=LOG_EVAL_PERIOD),
         ],
     )

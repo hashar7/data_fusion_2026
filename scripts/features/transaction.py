@@ -70,6 +70,31 @@ def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .alias("tx_type_group"),
     ])
 
+    # ── Model routing group ────────────────────────────────────────────────────
+    # Splits nonpayment into two sub-groups based on event_type_nm because the
+    # within-nonpayment fraud rate varies from 22 % to 79 % across event types
+    # and event_type_nm=7 (70 M rows, 58 % fraud) dominates the population,
+    # causing a single nonpayment model to under-fit the rarer types.
+    #
+    # 0 = nonpayment-type7  (tx_type_group==0 AND event_type_nm==7)
+    # 1 = nonpayment-other  (tx_type_group==0 AND event_type_nm!=7)
+    # 2 = card              (tx_type_group==1)
+    # 3 = p2p               (tx_type_group==2)
+    #
+    # model_group is used only for routing to the correct booster at train/predict
+    # time.  It is excluded from the model feature set via NON_FEATURE_COLS.
+    lf = lf.with_columns([
+        when((col("tx_type_group") == 0) & (col("event_type_nm") == 7))
+        .then(lit(0))
+        .when((col("tx_type_group") == 0) & (col("event_type_nm") != 7))
+        .then(lit(1))
+        .when(col("tx_type_group") == 1)
+        .then(lit(2))
+        .otherwise(lit(3))
+        .cast(pl.Int8)
+        .alias("model_group"),
+    ])
+
     # Masked amounts for rolling aggregation by transaction type.
     # amount_card / amount_p2p contribute their amount in the relevant window sums;
     # the other type contributes 0, so window sums give per-type spending directly.

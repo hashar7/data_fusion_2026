@@ -202,7 +202,7 @@ def build_memmaps(
         if len(train_chunk) > 0:
             X_np  = train_chunk.select(feature_cols).to_numpy(allow_copy=True).astype(np.float32)
             y_np  = train_chunk["target"].to_numpy().astype(np.int8)
-            tg_np = train_chunk["tx_type_group"].to_numpy().astype(np.int8)
+            tg_np = train_chunk["model_group"].to_numpy().astype(np.int8)
             n     = len(train_chunk)
             X_train_mm[train_cursor : train_cursor + n]  = X_np
             y_train_mm[train_cursor : train_cursor + n]  = y_np
@@ -217,7 +217,7 @@ def build_memmaps(
             X_np  = val_chunk.select(feature_cols).to_numpy(allow_copy=True).astype(np.float32)
             y_np  = val_chunk["target"].to_numpy().astype(np.int8)
             il_np = val_chunk["event_id"].is_in(labels_event_ids).cast(pl.Int8).to_numpy().astype(np.int8)
-            tg_np = val_chunk["tx_type_group"].to_numpy().astype(np.int8)
+            tg_np = val_chunk["model_group"].to_numpy().astype(np.int8)
             n     = len(val_chunk)
             X_val_mm[val_cursor : val_cursor + n]  = X_np
             y_val_mm[val_cursor : val_cursor + n]  = y_np
