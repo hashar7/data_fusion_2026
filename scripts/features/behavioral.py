@@ -73,6 +73,18 @@ def add_behavioral_features(lf: pl.LazyFrame) -> pl.LazyFrame:
 
         col("amount_clean").cum_max().shift(1).over(["customer_id", "channel_indicator_sub_type"])
         .fill_null(0).alias("operaton_amt_sub_max_prev"),
+
+        col("amount_clean").cum_max().shift(1).over(["customer_id", "channel_type_subtype"])
+        .fill_null(0).alias("operaton_amt_type_subtype_max_prev"),
+
+        col("amount_clean").cum_max().shift(1).over(["customer_id", "evtype_channel"])
+        .fill_null(0).alias("operaton_amt_evtype_channel_max_prev"),
+
+        col("amount_clean").cum_max().shift(1).over(["customer_id", "evtype_subchannel"])
+        .fill_null(0).alias("operaton_amt_evtype_subchannel_max_prev"),
+
+        col("amount_clean").cum_max().shift(1).over(["customer_id", "event_type_nm", "mcc_code"])
+        .fill_null(0).alias("operaton_amt_evtype_mcc_max_prev"),
     ])
 
     # ── Log-frequency features ────────────────────────────────────────────────
@@ -100,6 +112,18 @@ def add_behavioral_features(lf: pl.LazyFrame) -> pl.LazyFrame:
 
         (col("channel_indicator_type").cum_count().over(["customer_id", "channel_indicator_type"]) - 1)
         .cast(pl.Float32).log1p().alias("channel_indicator_type_log_count"),
+
+        (col("channel_type_subtype").cum_count().over(["customer_id", "channel_type_subtype"]) - 1)
+        .cast(pl.Float32).log1p().alias("channel_type_subtype_log_count"),
+
+        (col("evtype_channel").cum_count().over(["customer_id", "evtype_channel"]) - 1)
+        .cast(pl.Float32).log1p().alias("evtype_channel_log_count"),
+
+        (col("evtype_subchannel").cum_count().over(["customer_id", "evtype_subchannel"]) - 1)
+        .cast(pl.Float32).log1p().alias("evtype_subchannel_log_count"),
+
+        (col("event_type_nm").cum_count().over(["customer_id", "event_type_nm", "mcc_code"]) - 1)
+        .cast(pl.Float32).log1p().alias("evtype_mcc_log_count"),
 
         (col("device_system_version").cum_count().over(["customer_id", "device_system_version"]) - 1)
         .cast(pl.Float32).log1p().alias("device_system_version_log_count"),

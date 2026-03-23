@@ -131,6 +131,80 @@ def compute_global_stats(
         .agg(pl.len().alias("global_subchannel_freq"))
     )
 
+    # ── Combined channel_type × subtype stats ──────────────────────────────
+    # Derived inline (same formula as transaction.py) so we don't depend on
+    # the feature-engineering pipeline having already added the column.
+    _train_with_cts = train_lf.with_columns(
+        (col("channel_indicator_type") * 1000 + col("channel_indicator_sub_type"))
+        .cast(pl.Int32)
+        .alias("channel_type_subtype")
+    )
+    stats["channel_type_subtype_stats_global"] = (
+        _train_with_cts
+        .group_by("channel_type_subtype")
+        .agg([
+            col("amount_clean").mean().alias("channel_type_subtype_global_mean"),
+            col("amount_clean").std().alias("channel_type_subtype_global_std"),
+        ])
+    )
+    stats["channel_type_subtype_global"] = (
+        _train_with_cts
+        .group_by("channel_type_subtype")
+        .agg(pl.len().alias("global_channel_type_subtype_freq"))
+    )
+
+    # ── Combined evtype_channel / evtype_subchannel stats ─────────────────────
+    _train_with_ev = train_lf.with_columns([
+        (col("event_type_nm") * 1000 + col("channel_indicator_type"))
+        .cast(pl.Int32)
+        .alias("evtype_channel"),
+
+        (col("event_type_nm") * 1000 + col("channel_indicator_sub_type"))
+        .cast(pl.Int32)
+        .alias("evtype_subchannel"),
+    ])
+    stats["evtype_channel_stats_global"] = (
+        _train_with_ev
+        .group_by("evtype_channel")
+        .agg([
+            col("amount_clean").mean().alias("evtype_channel_global_mean"),
+            col("amount_clean").std().alias("evtype_channel_global_std"),
+        ])
+    )
+    stats["evtype_channel_global"] = (
+        _train_with_ev
+        .group_by("evtype_channel")
+        .agg(pl.len().alias("global_evtype_channel_freq"))
+    )
+    stats["evtype_subchannel_stats_global"] = (
+        _train_with_ev
+        .group_by("evtype_subchannel")
+        .agg([
+            col("amount_clean").mean().alias("evtype_subchannel_global_mean"),
+            col("amount_clean").std().alias("evtype_subchannel_global_std"),
+        ])
+    )
+    stats["evtype_subchannel_global"] = (
+        _train_with_ev
+        .group_by("evtype_subchannel")
+        .agg(pl.len().alias("global_evtype_subchannel_freq"))
+    )
+
+    # ── Combined event_type_nm × mcc_code stats (two-column, mcc is String) ─
+    stats["evtype_mcc_stats_global"] = (
+        train_lf
+        .group_by(["event_type_nm", "mcc_code"])
+        .agg([
+            col("amount_clean").mean().alias("evtype_mcc_global_mean"),
+            col("amount_clean").std().alias("evtype_mcc_global_std"),
+        ])
+    )
+    stats["evtype_mcc_global"] = (
+        train_lf
+        .group_by(["event_type_nm", "mcc_code"])
+        .agg(pl.len().alias("global_evtype_mcc_freq"))
+    )
+
     # ── Bayesian-smoothed target encodings ────────────────────────────────────
     # Requires labels_lf (event_id → target).  Skipped when not provided.
     if labels_lf is not None:
@@ -184,6 +258,26 @@ def compute_global_stats(
             # mcc_code is null for non-card transactions; unseen values filled with global rate at join time
             ("mcc_code",                  "mcc_target_enc",                 "mcc_target_enc"),
         ]
+
+        # Derive combined columns on labeled_tx so the TEs can group by them.
+        labeled_tx = labeled_tx.with_columns([
+            (col("channel_indicator_type") * 1000 + col("channel_indicator_sub_type"))
+            .cast(pl.Int32)
+            .alias("channel_type_subtype"),
+
+            (col("event_type_nm") * 1000 + col("channel_indicator_type"))
+            .cast(pl.Int32)
+            .alias("evtype_channel"),
+
+            (col("event_type_nm") * 1000 + col("channel_indicator_sub_type"))
+            .cast(pl.Int32)
+            .alias("evtype_subchannel"),
+        ])
+        _te_single.extend([
+            ("channel_type_subtype",  "channel_type_subtype_target_enc", "channel_type_subtype_target_enc"),
+            ("evtype_channel",        "evtype_channel_target_enc",       "evtype_channel_target_enc"),
+            ("evtype_subchannel",     "evtype_subchannel_target_enc",    "evtype_subchannel_target_enc"),
+        ])
         for join_col, feat_name, key in _te_single:
             stats[key] = (
                 labeled_tx
@@ -218,6 +312,24 @@ def compute_global_stats(
                 ).alias("type_desc_pair_target_enc")
             ])
             .select(["event_type_nm", "event_desc", "type_desc_pair_target_enc"])
+        )
+
+        # ── Pair target encoding: (event_type_nm × mcc_code) ─────────────────
+        # Two-column join because mcc_code is String type.
+        stats["evtype_mcc_target_enc"] = (
+            labeled_tx
+            .group_by(["event_type_nm", "mcc_code"])
+            .agg([
+                col("target").sum().cast(pl.Float64).alias("_fraud"),
+                pl.len().cast(pl.Float64).alias("_n"),
+            ])
+            .with_columns([
+                (
+                    (col("_fraud") + _ALPHA * _global_rate) /
+                    (col("_n") + _ALPHA)
+                ).alias("evtype_mcc_target_enc")
+            ])
+            .select(["event_type_nm", "mcc_code", "evtype_mcc_target_enc"])
         )
 
         # ── Within-group channel target encodings ─────────────────────────────

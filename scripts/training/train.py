@@ -24,6 +24,8 @@ def train_model(
     lgbm_params: dict | None = None,
     early_stopping_rounds: int | None = None,
     seed_override: int | None = None,
+    retrain_extra: tuple[np.ndarray, np.ndarray] | None = None,
+    n_rounds_fixed: int | None = None,
 ) -> lgb.Booster:
     """
     Train a LightGBM binary classifier.
@@ -37,6 +39,11 @@ def train_model(
                         for training. Group filtering + undersampling are
                         applied jointly so only the final sample is loaded
                         into RAM from the memmap.
+    retrain_extra     : optional (X_extra, y_extra) arrays to append to
+                        training data after undersampling. Used for
+                        full-data retraining (appending labeled-val rows).
+    n_rounds_fixed    : when set, train for exactly this many rounds with
+                        no early stopping. Used for full-data retraining.
     """
     rng = np.random.default_rng(seed_override if seed_override is not None else UNDERSAMPLE_SEED)
     if neg_sample_ratio is None:
@@ -95,33 +102,73 @@ def train_model(
         del group_global_idx
     gc.collect()
 
+    # ── Append extra rows (full-data retraining) ──────────────────────────────
+    if retrain_extra is not None:
+        X_extra, y_extra = retrain_extra
+        print(f"  Appending {len(y_extra):,} extra rows (retrain_extra)", flush=True)
+        X_train_used = np.concatenate([X_train_used, X_extra], axis=0)
+        y_train_used = np.concatenate([y_train_used, y_extra], axis=0)
+        del X_extra, y_extra
+        gc.collect()
+
+    num_rounds = n_rounds_fixed if n_rounds_fixed is not None else base_params.get("n_estimators", LGBM_PARAMS["n_estimators"])
+    use_early_stopping = n_rounds_fixed is None
+
     # ── Labeled val rows for early stopping ───────────────────────────────────
-    labeled_mask  = np.asarray(il_val) == 1
-    X_val_labeled = np.array(X_val[labeled_mask])
-    y_val_labeled = np.array(y_val[labeled_mask])
-    print(f"  Labeled val rows for early stopping: {labeled_mask.sum():,} / {len(il_val):,}\n",
-          flush=True)
-    del labeled_mask
-    gc.collect()
+    if use_early_stopping:
+        labeled_mask  = np.asarray(il_val) == 1
+        X_val_labeled = np.array(X_val[labeled_mask])
+        y_val_labeled = np.array(y_val[labeled_mask])
+        print(f"  Labeled val rows for early stopping: {labeled_mask.sum():,} / {len(il_val):,}\n",
+              flush=True)
+        del labeled_mask
+        gc.collect()
+    else:
+        print(f"  Fixed-round training: {num_rounds} rounds (no early stopping)\n",
+              flush=True)
 
     print("Training LightGBM …", flush=True)
     for k, v in params.items():
         print(f"  {k:25s}: {v}")
     print(flush=True)
 
+    # ── Sample weights: correct for undersampling bias ────────────────────────
+    # Retained negatives are upweighted to 1/neg_sample_ratio so that the loss
+    # gradient landscape matches the true class distribution.  Positives keep
+    # weight = 1.  When no undersampling is used all weights are 1.
+    if neg_sample_ratio is not None:
+        weights = np.ones(len(y_train_used), dtype=np.float32)
+        weights[y_train_used == 0] = 1.0 / neg_sample_ratio
+    else:
+        weights = None
+
     free_train = neg_sample_ratio is not None
     dtrain = lgb.Dataset(
         X_train_used, label=y_train_used,
+        weight=weights,
         feature_name=feature_cols,
         free_raw_data=free_train,
     )
-    dval = lgb.Dataset(
-        X_val_labeled, label=y_val_labeled,
-        feature_name=feature_cols,
-        reference=dtrain,
-        free_raw_data=True,
-    )
-    del X_val_labeled, y_val_labeled
+
+    if use_early_stopping:
+        dval = lgb.Dataset(
+            X_val_labeled, label=y_val_labeled,
+            feature_name=feature_cols,
+            reference=dtrain,
+            free_raw_data=True,
+        )
+        del X_val_labeled, y_val_labeled
+        valid_sets  = [dval]
+        valid_names = ["val"]
+        callbacks   = [
+            lgb.early_stopping(stopping_rounds=es_rounds, verbose=True),
+            lgb.log_evaluation(period=LOG_EVAL_PERIOD),
+        ]
+    else:
+        valid_sets  = []
+        valid_names = []
+        callbacks   = [lgb.log_evaluation(period=LOG_EVAL_PERIOD)]
+
     if free_train:
         del X_train_used, y_train_used
     gc.collect()
@@ -130,17 +177,17 @@ def train_model(
     booster = lgb.train(
         params=params,
         train_set=dtrain,
-        num_boost_round=base_params.get("n_estimators", LGBM_PARAMS["n_estimators"]),
-        valid_sets=[dval],
-        valid_names=["val"],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=es_rounds, verbose=True),
-            lgb.log_evaluation(period=LOG_EVAL_PERIOD),
-        ],
+        num_boost_round=num_rounds,
+        valid_sets=valid_sets,
+        valid_names=valid_names,
+        callbacks=callbacks,
     )
 
     print(f"\n  Training time   : {_fmt(time.perf_counter() - t0)}")
     print(f"  Best iteration  : {booster.best_iteration}")
-    print(f"  Best val PR-AUC : "
-          f"{booster.best_score['val']['average_precision']:.6f}\n")
+    if use_early_stopping:
+        print(f"  Best val PR-AUC : "
+              f"{booster.best_score['val']['average_precision']:.6f}\n")
+    else:
+        print()
     return booster

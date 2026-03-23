@@ -95,11 +95,16 @@ EARLY_STOPPING_ROUNDS_BY_GROUP = {
 
 # ── Multi-seed ensemble ────────────────────────────────────────────────────────
 # Each group is trained N times with different random seeds; val scores are
-# averaged before blending and calibration.  3 seeds gives a good bias/variance
-# tradeoff without tripling the wall time (early stopping keeps runs short).
-ENSEMBLE_SEEDS = [42, 7, 13]
+# averaged before blending.  5 seeds reduces variance at moderate wall-time cost
+# (early stopping keeps individual runs short).
+ENSEMBLE_SEEDS = [42, 7, 13, 17, 99]
+
+# CatBoost multi-seed: train this many CatBoost seeds per group and average.
+# 3 seeds balances variance reduction against wall-time (CatBoost is slower).
+CATBOOST_SEEDS = [42, 7, 13]
 
 # ── CatBoost parameters ────────────────────────────────────────────────────────
+# Default fallback weight; overridden per-group via grid search at training time.
 CATBOOST_BLEND_WEIGHT = 0.25   # fraction of CatBoost score in LightGBM+CatBoost blend
 
 CATBOOST_PARAMS = {
@@ -108,7 +113,7 @@ CATBOOST_PARAMS = {
     "depth":                 8,
     "l2_leaf_reg":           3.0,
     "loss_function":         "Logloss",
-    "eval_metric":           "AUC",
+    "eval_metric":           "PRAUC",
     "task_type":             "CPU",
     "thread_count":          -1,
     "random_seed":           42,
@@ -119,9 +124,38 @@ CATBOOST_PARAMS = {
 # Per-group CatBoost overrides (same merge pattern as LGBM_PARAMS_BY_GROUP).
 CATBOOST_PARAMS_BY_GROUP: dict = {}
 
+# ── Full-data retraining ──────────────────────────────────────────────────────
+# After the stacker/blend weights are determined on the val split, retrain
+# every base model on train + labeled-val rows combined using
+# best_iteration × RETRAIN_FULL_ITER_FACTOR rounds (no early stopping).
+# The submission is generated from the retrained models only.
+RETRAIN_FULL_ITER_FACTOR = 1.05   # 5 % extra rounds to compensate for loss of val signal
+
+# ── Dead feature blacklist ─────────────────────────────────────────────────────
+# Features with exactly zero split gain across all seeds and groups (from
+# feature_importances.csv).  Removing them reduces noise and speeds up training.
+FEATURE_BLACKLIST = {
+    "compromised_and_high_amount_flag",
+    "timezone_mismatch",
+    "burst_flag_15m",
+    "voip_and_new_mcc_flag",
+    "suspicious_env_flag",
+    "mcc_rare_global_flag",
+    "rare_combination_flag",
+    "developer_tools_flag",
+    "compromised_flag",
+    "compromised_x_amount_ratio",
+    "pos_cd_is_new",
+    "mcc_is_new_for_user",
+    "amount_usd_normalized",
+    "amount_missing_flag",
+    "new_device_and_night_flag",
+    "new_mcc_flag",
+    "new_channel_flag",
+}
+
 # ── Ensemble model path formats ────────────────────────────────────────────────
 # {name}     = group name (np_type7, np_other, card, p2p)
-# {seed_idx} = 0-based seed index within ENSEMBLE_SEEDS
+# {seed_idx} = 0-based seed index within ENSEMBLE_SEEDS / CATBOOST_SEEDS
 LGBM_MODEL_PATH_FMT     = "model_{name}_s{seed_idx}.txt"
-CATBOOST_MODEL_PATH_FMT = "model_{name}_catboost.cbm"
-CALIBRATOR_PATH_FMT     = "calibrator_{name}.pkl"
+CATBOOST_MODEL_PATH_FMT = "model_{name}_catboost_s{seed_idx}.cbm"

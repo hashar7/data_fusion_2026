@@ -15,9 +15,10 @@ from scripts.training.config import (
     NEG_SAMPLE_RATIO, NEG_SAMPLE_RATIO_BY_GROUP,
     LGBM_PARAMS, LGBM_PARAMS_BY_GROUP,
     EARLY_STOPPING_ROUNDS_BY_GROUP,
-    ENSEMBLE_SEEDS,
+    ENSEMBLE_SEEDS, CATBOOST_SEEDS,
     CATBOOST_PARAMS, CATBOOST_PARAMS_BY_GROUP, CATBOOST_BLEND_WEIGHT,
     LGBM_MODEL_PATH_FMT, CATBOOST_MODEL_PATH_FMT,
+    RETRAIN_FULL_ITER_FACTOR, UNDERSAMPLE_SEED,
 )
 from scripts.training._utils import _fmt, _parquet_files, _progress
 from scripts.training.data import load_labels, count_rows, build_memmaps, _load_cache
@@ -106,14 +107,16 @@ def _score_val_group(
 def train_baseline() -> None:
     """
     Train one LightGBM ensemble (multi-seed) + one CatBoost per tx_type_group,
-    blend and calibrate scores, evaluate each group independently, compute the
-    combined PR-AUC, save all models, then score the test set.
+    blend scores, evaluate each group independently, compute the combined
+    PR-AUC, then retrain all models on full data (train + labeled val) and
+    use the retrained models to score the test set.
 
     Pipeline per group:
         1. Train LGBM N times with different seeds → average val scores
         2. Train CatBoost → blend with LGBM avg
-        3. Fit Platt calibrator on labeled val rows → calibrate blended scores
-        4. Compute ensemble PR-AUC on calibrated scores
+        3. Compute ensemble PR-AUC on blended scores
+        4. Retrain all models on train + labeled-val with fixed rounds
+        5. Score test set with retrained models
     """
     total_start = time.perf_counter()
     cutoff    = datetime.fromisoformat(VAL_CUTOFF_DATE)
@@ -125,8 +128,10 @@ def train_baseline() -> None:
     if not files:
         raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
     print(f"Found {len(files)} parquet partitions in {FEATURES_DIR!r}\n", flush=True)
-    print(f"Ensemble seeds   : {ENSEMBLE_SEEDS}")
-    print(f"CatBoost weight  : {CATBOOST_BLEND_WEIGHT}\n", flush=True)
+    print(f"Ensemble seeds          : {ENSEMBLE_SEEDS}")
+    print(f"CatBoost seeds          : {CATBOOST_SEEDS}")
+    print(f"CatBoost default weight : {CATBOOST_BLEND_WEIGHT}")
+    print(f"Retrain iter factor     : {RETRAIN_FULL_ITER_FACTOR}\n", flush=True)
 
     # ── Step 1: Build or reload memmap split files ────────────────────────────
     cached = _load_cache(STAGING_DIR)
@@ -153,9 +158,11 @@ def train_baseline() -> None:
 
     all_val_scores = np.full(len(y_val_np), np.nan, dtype=np.float32)
 
-    lgbm_boosters:   dict = {}   # group_id → list[lgb.Booster]
-    catboost_models: dict = {}   # group_id → CatBoostClassifier
     pr_aucs:         dict = {}
+    blend_weights:   dict = {}   # group_id → best CatBoost blend weight (from grid search)
+    # Per-group best iterations from initial training (used for retraining).
+    best_iters_lgbm:  dict = {}   # group_id → list[int]  (one per LGBM seed)
+    best_iters_cb:    dict = {}   # group_id → list[int]  (one per CatBoost seed)
 
     # ── Step 2: Train and evaluate one ensemble per group ────────────────────
     for group_id, group_name in TX_TYPE_GROUPS.items():
@@ -198,7 +205,7 @@ def train_baseline() -> None:
 
         # ── 2a. Multi-seed LightGBM ──────────────────────────────────────────
         lgbm_val_sum  = np.zeros(len(val_idx_g), dtype=np.float64)
-        seed_boosters: list = []
+        seed_best_iters: list[int] = []
 
         for seed_idx, seed in enumerate(ENSEMBLE_SEEDS):
             print(f"\n  ── LGBM seed {seed_idx + 1}/{len(ENSEMBLE_SEEDS)} "
@@ -213,9 +220,7 @@ def train_baseline() -> None:
                 early_stopping_rounds=group_es_rounds,
                 seed_override=seed,
             )
-            path = os.path.join(MODELS_DIR, LGBM_MODEL_PATH_FMT.format(name=group_name, seed_idx=seed_idx))
-            booster.save_model(path)
-            print(f"  LGBM model saved → {path}")
+            seed_best_iters.append(booster.best_iteration)
 
             # Diagnostic evaluation (feature importance) on first seed only.
             if seed_idx == 0:
@@ -231,55 +236,77 @@ def train_baseline() -> None:
                 suffix=f"lgbm s{seed_idx} {group_name}",
             )
             lgbm_val_sum += s.astype(np.float64)
-            seed_boosters.append(booster)
-            del s
+            del booster, s
             gc.collect()
 
-        lgbm_boosters[group_id] = seed_boosters
+        best_iters_lgbm[group_id] = seed_best_iters
         lgbm_val_scores = (lgbm_val_sum / len(ENSEMBLE_SEEDS)).astype(np.float32)
         del lgbm_val_sum
         gc.collect()
 
-        # ── 2b. CatBoost ────────────────────────────────────────────────────
-        print(f"\n  ── CatBoost ────────────────────────────────────────────────")
-        cb_model = train_catboost_model(
-            X_train, y_train,
-            X_val_labeled_g, y_val_labeled_g, il_val_ones_g,
-            feature_cols,
-            train_row_mask=train_mask,
-            neg_sample_ratio=group_neg_ratio,
-            catboost_params=group_cb_params,
-        )
-        cb_path = os.path.join(MODELS_DIR, CATBOOST_MODEL_PATH_FMT.format(name=group_name))
-        cb_model.save_model(cb_path)
-        print(f"  CatBoost model saved → {cb_path}")
-        catboost_models[group_id] = cb_model
+        # ── 2b. CatBoost multi-seed ──────────────────────────────────────────
+        cb_val_sum       = np.zeros(len(val_idx_g), dtype=np.float64)
+        cb_seed_best_iters: list[int] = []
 
-        print(f"  Scoring val rows (CatBoost) …", flush=True)
-        cb_val_scores = _score_val_group(
-            cb_model, X_val, val_idx_g,
-            is_catboost=True, suffix=f"catboost {group_name}",
-        )
+        for cb_seed_idx, cb_seed in enumerate(CATBOOST_SEEDS):
+            print(f"\n  ── CatBoost seed {cb_seed_idx + 1}/{len(CATBOOST_SEEDS)} "
+                  f"(seed={cb_seed}) ────────────────────────────────────")
+            cb_model = train_catboost_model(
+                X_train, y_train,
+                X_val_labeled_g, y_val_labeled_g, il_val_ones_g,
+                feature_cols,
+                train_row_mask=train_mask,
+                neg_sample_ratio=group_neg_ratio,
+                catboost_params=group_cb_params,
+                seed_override=cb_seed,
+            )
+            cb_seed_best_iters.append(cb_model.best_iteration_)
+
+            print(f"  Scoring val rows (CatBoost seed {cb_seed_idx}) …", flush=True)
+            s = _score_val_group(
+                cb_model, X_val, val_idx_g,
+                is_catboost=True, suffix=f"catboost s{cb_seed_idx} {group_name}",
+            )
+            cb_val_sum += s.astype(np.float64)
+            del cb_model, s
+            gc.collect()
+
+        best_iters_cb[group_id] = cb_seed_best_iters
+        cb_val_scores = (cb_val_sum / len(CATBOOST_SEEDS)).astype(np.float32)
+        del cb_val_sum
 
         del X_val_labeled_g, y_val_labeled_g, il_val_ones_g
         gc.collect()
 
-        # ── 2c. Blend ────────────────────────────────────────────────────────
-        w = CATBOOST_BLEND_WEIGHT
+        # ── 2c. Per-group blend weight grid search ────────────────────────────
+        il_g          = il_val_np[val_idx_g]
+        labeled_local = np.where(il_g == 1)[0]
+        y_labeled     = y_val_np[val_idx_g][labeled_local]
+        lgbm_lbl      = lgbm_val_scores[labeled_local]
+        cb_lbl        = cb_val_scores[labeled_local]
+
+        best_w      = CATBOOST_BLEND_WEIGHT
+        best_prauc  = 0.0
+        if len(labeled_local) > 0 and y_labeled.sum() > 0:
+            for w_cand in np.arange(0.0, 0.55, 0.05):
+                blended_cand = lgbm_lbl * (1.0 - w_cand) + cb_lbl * w_cand
+                p = average_precision_score(y_labeled, blended_cand)
+                if p > best_prauc:
+                    best_prauc, best_w = p, float(w_cand)
+        blend_weights[group_id] = best_w
+        print(f"\n  Blend weight grid search [{group_name}]: "
+              f"best_w={best_w:.2f}  PR-AUC={best_prauc:.6f}")
+        del lgbm_lbl, cb_lbl
+
+        # ── 2d. Blend with optimised weight ──────────────────────────────────
+        w = best_w
         blended_scores = (
             lgbm_val_scores * (1.0 - w) + cb_val_scores * w
         ).astype(np.float32)
         del lgbm_val_scores, cb_val_scores
         gc.collect()
 
-        # ── 2d. Per-group ensemble PR-AUC ────────────────────────────────────
-        # Raw blended scores are used directly — no Platt calibration.
-        # Calibration on labeled val rows (50% positive) would inflate test scores
-        # to 0.35-0.5 for every row, as the calibrated prior doesn't match the
-        # true 0.06% positive rate in the competition.
-        il_g          = il_val_np[val_idx_g]
-        labeled_local = np.where(il_g == 1)[0]
-        y_labeled     = y_val_np[val_idx_g][labeled_local]
+        # ── 2e. Per-group ensemble PR-AUC ─────────────────────────────────────
         blended_lbl   = blended_scores[labeled_local]
 
         if len(labeled_local) > 0 and y_labeled.sum() > 0:
@@ -314,13 +341,135 @@ def train_baseline() -> None:
         if g in pr_aucs:
             print(f"  {name:12s} ensemble PR-AUC : {pr_aucs[g]:.6f}")
 
-    # ── Step 4: Score test set ────────────────────────────────────────────────
-    if lgbm_boosters:
-        score_test(lgbm_boosters, catboost_models, feature_cols, SUBMISSION_PATH)
+    del all_val_scores
+    gc.collect()
+
+    # ── Step 4: Retrain on full data (train + labeled val) ────────────────────
+    print(f"\n{'=' * 65}")
+    print("  Full-data retraining  (train + labeled val, no early stopping)")
+    print(f"{'=' * 65}\n")
+
+    lgbm_boosters_full:   dict = {}   # group_id → list[lgb.Booster]
+    catboost_models_full: dict = {}   # group_id → CatBoostClassifier
+
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        if group_id not in best_iters_lgbm:
+            continue
+
+        sep = "-" * 65
+        print(f"\n{sep}")
+        print(f"  Full-data retrain — Group {group_id} — {group_name.upper()}")
+        print(f"{sep}\n")
+
+        train_mask       = tg_train_np == group_id
+        labeled_val_mask = (tg_val_np == group_id) & (il_val_np == 1)
+
+        # Extract labeled val rows for this group.
+        # Item 7 fix: undersample val negatives at the same ratio as train negatives
+        # before appending, so the combined pool has a consistent class balance.
+        labeled_val_idx = np.where(labeled_val_mask)[0]
+        X_val_extra_all = np.array(X_val[labeled_val_idx])
+        y_val_extra_all = np.array(y_val[labeled_val_idx])
+
+        val_pos_idx = np.where(y_val_extra_all == 1)[0]
+        val_neg_idx = np.where(y_val_extra_all == 0)[0]
+        if len(val_neg_idx) > 0:
+            n_val_neg_keep  = max(int(len(val_neg_idx) * group_neg_ratio), len(val_pos_idx))
+            n_val_neg_keep  = min(n_val_neg_keep, len(val_neg_idx))
+            _rng_val        = np.random.default_rng(UNDERSAMPLE_SEED)
+            val_neg_sampled = _rng_val.choice(val_neg_idx, size=n_val_neg_keep, replace=False)
+            val_keep        = np.sort(np.concatenate([val_pos_idx, val_neg_sampled]))
+        else:
+            val_keep = val_pos_idx
+
+        X_val_extra = X_val_extra_all[val_keep]
+        y_val_extra = y_val_extra_all[val_keep]
+        del X_val_extra_all, y_val_extra_all, val_pos_idx, val_neg_idx, val_keep
+        gc.collect()
+
+        print(f"  Extra val rows for retraining: {len(y_val_extra):,} "
+              f"({int(y_val_extra.sum())} pos, {int((y_val_extra==0).sum())} neg "
+              f"— undersampled at {group_neg_ratio:.0%})")
+
+        group_neg_ratio   = NEG_SAMPLE_RATIO_BY_GROUP.get(group_id, NEG_SAMPLE_RATIO)
+        group_lgbm_params = {**LGBM_PARAMS, **LGBM_PARAMS_BY_GROUP.get(group_id, {})}
+        group_cb_params   = {**CATBOOST_PARAMS, **CATBOOST_PARAMS_BY_GROUP.get(group_id, {})}
+
+        # Dummy val arrays (not used when n_rounds_fixed is set).
+        _dummy_X = np.empty((0, len(feature_cols)), dtype=np.float32)
+        _dummy_y = np.empty((0,), dtype=np.int8)
+        _dummy_il = np.empty((0,), dtype=np.int8)
+
+        # ── 4a. Multi-seed LightGBM (full data) ─────────────────────────────
+        seed_boosters_full: list = []
+        for seed_idx, seed in enumerate(ENSEMBLE_SEEDS):
+            bi = best_iters_lgbm[group_id][seed_idx]
+            n_rounds = int(bi * RETRAIN_FULL_ITER_FACTOR)
+            print(f"\n  ── LGBM full retrain seed {seed_idx + 1}/{len(ENSEMBLE_SEEDS)} "
+                  f"(seed={seed}, rounds={n_rounds} from best_iter={bi}) ──")
+            booster = train_model(
+                X_train, y_train,
+                _dummy_X, _dummy_y, _dummy_il,
+                feature_cols,
+                train_row_mask=train_mask,
+                neg_sample_ratio=group_neg_ratio,
+                lgbm_params=group_lgbm_params,
+                seed_override=seed,
+                retrain_extra=(X_val_extra, y_val_extra),
+                n_rounds_fixed=n_rounds,
+            )
+            path = os.path.join(MODELS_DIR, LGBM_MODEL_PATH_FMT.format(name=group_name, seed_idx=seed_idx))
+            booster.save_model(path)
+            print(f"  LGBM full model saved → {path}")
+            seed_boosters_full.append(booster)
+            del booster
+            gc.collect()
+
+        lgbm_boosters_full[group_id] = seed_boosters_full
+
+        # ── 4b. CatBoost multi-seed (full data) ──────────────────────────────
+        cb_seed_models_full: list = []
+        for cb_seed_idx, cb_seed in enumerate(CATBOOST_SEEDS):
+            cb_bi       = best_iters_cb[group_id][cb_seed_idx]
+            cb_n_rounds = int(cb_bi * RETRAIN_FULL_ITER_FACTOR)
+            print(f"\n  ── CatBoost full retrain seed {cb_seed_idx + 1}/{len(CATBOOST_SEEDS)} "
+                  f"(seed={cb_seed}, rounds={cb_n_rounds} from best_iter={cb_bi}) ──")
+            cb_model = train_catboost_model(
+                X_train, y_train,
+                _dummy_X, _dummy_y, _dummy_il,
+                feature_cols,
+                train_row_mask=train_mask,
+                neg_sample_ratio=group_neg_ratio,
+                catboost_params=group_cb_params,
+                seed_override=cb_seed,
+                retrain_extra=(X_val_extra, y_val_extra),
+                n_rounds_fixed=cb_n_rounds,
+            )
+            cb_path = os.path.join(
+                MODELS_DIR,
+                CATBOOST_MODEL_PATH_FMT.format(name=group_name, seed_idx=cb_seed_idx),
+            )
+            cb_model.save_model(cb_path)
+            print(f"  CatBoost full model saved → {cb_path}")
+            cb_seed_models_full.append(cb_model)
+            del cb_model
+            gc.collect()
+
+        catboost_models_full[group_id] = cb_seed_models_full
+
+        del X_val_extra, y_val_extra
+        gc.collect()
+
+    # ── Step 5: Score test set with retrained models ─────────────────────────
+    if lgbm_boosters_full:
+        score_test(
+            lgbm_boosters_full, catboost_models_full, feature_cols, SUBMISSION_PATH,
+            blend_weights=blend_weights,
+        )
     else:
         print("\nWARNING: no models were trained — submission skipped.")
 
     print(f"\n{'─' * 65}")
     print(f"Total wall time  : {_fmt(time.perf_counter() - total_start)}")
-    print(f"Combined PR-AUC  : {combined_pr_auc:.6f}")
+    print(f"Combined PR-AUC  : {combined_pr_auc:.6f}  (val, before full retrain)")
     print("─" * 65)

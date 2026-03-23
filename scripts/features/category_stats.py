@@ -151,6 +151,122 @@ def add_category_stats_features(
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
+    # C2. Per-(customer, channel_type_subtype) cumulative stats
+    #     Combined channel type + subtype captures type×subtype interactions.
+    # ══════════════════════════════════════════════════════════════════════════
+    lf = lf.with_columns([
+        prior_mean_expr(["customer_id", "channel_type_subtype"]).alias("amount_mean_channel_type_subtype_user"),
+        prior_std_expr(["customer_id", "channel_type_subtype"]).alias("amount_std_channel_type_subtype_user"),
+
+        (
+            (col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "channel_type_subtype"]))
+            .dt.total_days()
+        ).fill_null(999).alias("channel_type_subtype_last_seen_days"),
+
+        (col("event_id").cum_count().over(["customer_id", "channel_type_subtype"]) - 1 == 0)
+        .cast(pl.Int8)
+        .alias("is_new_channel_type_subtype_for_user"),
+    ])
+
+    lf = lf.with_columns([
+        (
+            (col("amount_clean") - col("amount_mean_channel_type_subtype_user")) /
+            (col("amount_std_channel_type_subtype_user").fill_null(1) + EPS)
+        ).alias("amount_zscore_given_channel_type_subtype"),
+
+        (col("spend_in_channel_type_subtype_lifetime") / (col("cumulative_spend_90d").fill_null(0) + EPS))
+        .fill_null(0)
+        .alias("channel_type_subtype_spend_vs_90d"),
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # C3. Per-(customer, evtype_channel) cumulative stats
+    #     Combined event_type_nm × channel_indicator_type interactions.
+    # ══════════════════════════════════════════════════════════════════════════
+    lf = lf.with_columns([
+        prior_mean_expr(["customer_id", "evtype_channel"]).alias("amount_mean_evtype_channel_user"),
+        prior_std_expr(["customer_id", "evtype_channel"]).alias("amount_std_evtype_channel_user"),
+
+        (
+            (col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "evtype_channel"]))
+            .dt.total_days()
+        ).fill_null(999).alias("evtype_channel_last_seen_days"),
+
+        (col("event_id").cum_count().over(["customer_id", "evtype_channel"]) - 1 == 0)
+        .cast(pl.Int8)
+        .alias("is_new_evtype_channel_for_user"),
+    ])
+
+    lf = lf.with_columns([
+        (
+            (col("amount_clean") - col("amount_mean_evtype_channel_user")) /
+            (col("amount_std_evtype_channel_user").fill_null(1) + EPS)
+        ).alias("amount_zscore_given_evtype_channel"),
+
+        (col("spend_in_evtype_channel_lifetime") / (col("cumulative_spend_90d").fill_null(0) + EPS))
+        .fill_null(0)
+        .alias("evtype_channel_spend_vs_90d"),
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # C4. Per-(customer, evtype_subchannel) cumulative stats
+    #     Combined event_type_nm × channel_indicator_sub_type interactions.
+    # ══════════════════════════════════════════════════════════════════════════
+    lf = lf.with_columns([
+        prior_mean_expr(["customer_id", "evtype_subchannel"]).alias("amount_mean_evtype_subchannel_user"),
+        prior_std_expr(["customer_id", "evtype_subchannel"]).alias("amount_std_evtype_subchannel_user"),
+
+        (
+            (col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "evtype_subchannel"]))
+            .dt.total_days()
+        ).fill_null(999).alias("evtype_subchannel_last_seen_days"),
+
+        (col("event_id").cum_count().over(["customer_id", "evtype_subchannel"]) - 1 == 0)
+        .cast(pl.Int8)
+        .alias("is_new_evtype_subchannel_for_user"),
+    ])
+
+    lf = lf.with_columns([
+        (
+            (col("amount_clean") - col("amount_mean_evtype_subchannel_user")) /
+            (col("amount_std_evtype_subchannel_user").fill_null(1) + EPS)
+        ).alias("amount_zscore_given_evtype_subchannel"),
+
+        (col("spend_in_evtype_subchannel_lifetime") / (col("cumulative_spend_90d").fill_null(0) + EPS))
+        .fill_null(0)
+        .alias("evtype_subchannel_spend_vs_90d"),
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # C5. Per-(customer, event_type_nm, mcc_code) cumulative stats
+    #     Two-column .over() since mcc_code is String type.
+    # ══════════════════════════════════════════════════════════════════════════
+    lf = lf.with_columns([
+        prior_mean_expr(["customer_id", "event_type_nm", "mcc_code"]).alias("amount_mean_evtype_mcc_user"),
+        prior_std_expr(["customer_id", "event_type_nm", "mcc_code"]).alias("amount_std_evtype_mcc_user"),
+
+        (
+            (col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "event_type_nm", "mcc_code"]))
+            .dt.total_days()
+        ).fill_null(999).alias("evtype_mcc_last_seen_days"),
+
+        (col("event_id").cum_count().over(["customer_id", "event_type_nm", "mcc_code"]) - 1 == 0)
+        .cast(pl.Int8)
+        .alias("is_new_evtype_mcc_for_user"),
+    ])
+
+    lf = lf.with_columns([
+        (
+            (col("amount_clean") - col("amount_mean_evtype_mcc_user")) /
+            (col("amount_std_evtype_mcc_user").fill_null(1) + EPS)
+        ).alias("amount_zscore_given_evtype_mcc"),
+
+        (col("spend_in_evtype_mcc_lifetime") / (col("cumulative_spend_90d").fill_null(0) + EPS))
+        .fill_null(0)
+        .alias("evtype_mcc_spend_vs_90d"),
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
     # D. Per-(customer, pos_cd) cumulative stats
     #    Note: pos_freq_user_cum (cum_count - 1) and pos_cd_transaction_share_user
     #    already exist in behavioral.py; we add the spend-side stats only.
@@ -301,6 +417,70 @@ def add_category_stats_features(
             lf = lf.with_columns([
                 col("global_subchannel_freq").fill_null(0),
             ])
+
+        if "channel_type_subtype_stats_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["channel_type_subtype_stats_global"]), on="channel_type_subtype", how="left")
+            lf = lf.with_columns([
+                (
+                    (col("amount_clean") - col("channel_type_subtype_global_mean").fill_null(0)) /
+                    (col("channel_type_subtype_global_std").fill_null(1) + EPS)
+                ).alias("amount_zscore_channel_type_subtype_global"),
+            ])
+            lf = lf.drop(["channel_type_subtype_global_mean", "channel_type_subtype_global_std"])
+
+        if "channel_type_subtype_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["channel_type_subtype_global"]), on="channel_type_subtype", how="left")
+            lf = lf.with_columns([
+                col("global_channel_type_subtype_freq").fill_null(0),
+            ])
+
+        if "evtype_channel_stats_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_channel_stats_global"]), on="evtype_channel", how="left")
+            lf = lf.with_columns([
+                (
+                    (col("amount_clean") - col("evtype_channel_global_mean").fill_null(0)) /
+                    (col("evtype_channel_global_std").fill_null(1) + EPS)
+                ).alias("amount_zscore_evtype_channel_global"),
+            ])
+            lf = lf.drop(["evtype_channel_global_mean", "evtype_channel_global_std"])
+
+        if "evtype_channel_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_channel_global"]), on="evtype_channel", how="left")
+            lf = lf.with_columns([
+                col("global_evtype_channel_freq").fill_null(0),
+            ])
+
+        if "evtype_subchannel_stats_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_subchannel_stats_global"]), on="evtype_subchannel", how="left")
+            lf = lf.with_columns([
+                (
+                    (col("amount_clean") - col("evtype_subchannel_global_mean").fill_null(0)) /
+                    (col("evtype_subchannel_global_std").fill_null(1) + EPS)
+                ).alias("amount_zscore_evtype_subchannel_global"),
+            ])
+            lf = lf.drop(["evtype_subchannel_global_mean", "evtype_subchannel_global_std"])
+
+        if "evtype_subchannel_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_subchannel_global"]), on="evtype_subchannel", how="left")
+            lf = lf.with_columns([
+                col("global_evtype_subchannel_freq").fill_null(0),
+            ])
+
+        if "evtype_mcc_stats_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_mcc_stats_global"]), on=["event_type_nm", "mcc_code"], how="left")
+            lf = lf.with_columns([
+                (
+                    (col("amount_clean") - col("evtype_mcc_global_mean").fill_null(0)) /
+                    (col("evtype_mcc_global_std").fill_null(1) + EPS)
+                ).alias("amount_zscore_evtype_mcc_global"),
+            ])
+            lf = lf.drop(["evtype_mcc_global_mean", "evtype_mcc_global_std"])
+
+        if "evtype_mcc_global" in global_stats:
+            lf = lf.join(_to_lazy(global_stats["evtype_mcc_global"]), on=["event_type_nm", "mcc_code"], how="left")
+            lf = lf.with_columns([
+                col("global_evtype_mcc_freq").fill_null(0),
+            ])
     else:
         # Fallback when no global_stats: constant sentinel so schema is stable
         lf = lf.with_columns([
@@ -309,6 +489,14 @@ def add_category_stats_features(
             pl.lit(0.0).alias("amount_zscore_subchannel_global"),
             pl.lit(0.0).alias("amount_zscore_pos_global"),
             pl.lit(0).cast(pl.Int32).alias("global_subchannel_freq"),
+            pl.lit(0.0).alias("amount_zscore_channel_type_subtype_global"),
+            pl.lit(0).cast(pl.Int32).alias("global_channel_type_subtype_freq"),
+            pl.lit(0.0).alias("amount_zscore_evtype_channel_global"),
+            pl.lit(0).cast(pl.Int32).alias("global_evtype_channel_freq"),
+            pl.lit(0.0).alias("amount_zscore_evtype_subchannel_global"),
+            pl.lit(0).cast(pl.Int32).alias("global_evtype_subchannel_freq"),
+            pl.lit(0.0).alias("amount_zscore_evtype_mcc_global"),
+            pl.lit(0).cast(pl.Int32).alias("global_evtype_mcc_freq"),
         ])
 
     # Drop intermediate helper columns
@@ -328,6 +516,11 @@ def add_category_stats_features(
         ("channel_subtype_target_enc","channel_indicator_sub_type","channel_subtype_target_enc"),
         # MCC fraud rate — strong signal for card transactions; fills with global rate for non-card (null mcc_code)
         ("mcc_target_enc",           "mcc_code",                   "mcc_target_enc"),
+        # Combined channel type × subtype target encoding
+        ("channel_type_subtype_target_enc", "channel_type_subtype", "channel_type_subtype_target_enc"),
+        # Combined event_type × channel / subchannel target encodings
+        ("evtype_channel_target_enc", "evtype_channel", "evtype_channel_target_enc"),
+        ("evtype_subchannel_target_enc", "evtype_subchannel", "evtype_subchannel_target_enc"),
     ]
 
     if global_stats:
@@ -377,6 +570,18 @@ def add_category_stats_features(
                 )
             else:
                 lf = lf.with_columns(pl.lit(_fallback).alias(feat_name))
+
+        # evtype_mcc pair target encoding — two-column join (mcc_code is String)
+        if "evtype_mcc_target_enc" in global_stats:
+            lf = lf.join(
+                _to_lazy(global_stats["evtype_mcc_target_enc"]),
+                on=["event_type_nm", "mcc_code"],
+                how="left",
+            ).with_columns(
+                pl.col("evtype_mcc_target_enc").fill_null(_fallback)
+            )
+        else:
+            lf = lf.with_columns(pl.lit(_fallback).alias("evtype_mcc_target_enc"))
     else:
         # No global_stats at all: emit neutral constant so the schema is stable
         for _, _, feat_name in _SINGLE_TE:
@@ -385,5 +590,7 @@ def add_category_stats_features(
         lf = lf.with_columns(pl.lit(0.5).alias("channel_type_fraud_rate_within_group"))
         lf = lf.with_columns(pl.lit(0.5).alias("channel_subtype_fraud_rate_within_group"))
         lf = lf.with_columns(pl.lit(0.5).alias("mcc_target_enc"))
+        lf = lf.with_columns(pl.lit(0.5).alias("channel_type_subtype_target_enc"))
+        lf = lf.with_columns(pl.lit(0.5).alias("evtype_mcc_target_enc"))
 
     return lf
