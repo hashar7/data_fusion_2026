@@ -1,5 +1,6 @@
 import polars as pl
 from polars import col, lit, when
+from pathlib import Path
 
 # Russian federal public holidays encoded as month*100 + day (year-independent).
 # Source: Labour Code of the Russian Federation, Art. 112.
@@ -14,6 +15,16 @@ _RU_HOLIDAY_MMDD = [
     612,   # Jun 12 : Russia Day
     1104,  # Nov 4  : National Unity Day
 ]
+
+TX_KEY_COLS = [
+    "channel_indicator_type",
+    "channel_indicator_sub_type",
+    "event_type_nm",
+    "event_desc",
+]
+
+TX_KEY_MAP_FILENAME = "transaction_type_key_map.parquet"
+TX_KEY_MAP_PATH = Path(__file__).resolve().parent / "../../../data/misc" / TX_KEY_MAP_FILENAME
 
 
 def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -60,15 +71,46 @@ def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
 
     # ── Transaction type grouping ─────────────────────────────────────────────
     # 0 = non-payment (no amount), 1 = card (has amount + MCC), 2 = P2P (has amount, no MCC)
-    lf = lf.with_columns([
-        when(col("operaton_amt").is_null())
-        .then(lit(0))
-        .when(col("mcc_code").is_not_null() & (col("mcc_code") != ""))
-        .then(lit(1))
-        .otherwise(lit(2))
+
+    # lf = lf.with_columns([
+    #     when(col("operaton_amt").is_null())
+    #     .then(lit(0))
+    #     .when(col("mcc_code").is_not_null() & (col("mcc_code") != ""))
+    #     .then(lit(1))
+    #     .otherwise(lit(2))
+    #     .cast(pl.Int8)
+    #     .alias("tx_type_group"),
+    # ])
+
+    tx_key_map_lf = pl.scan_parquet(TX_KEY_MAP_PATH)
+    # if group was not encountered before, use fallback to categorise event into group
+    fallback_tx_group_expr = (
+        pl.when(
+            (pl.col("operaton_amt").is_null() | (pl.col("operaton_amt").cast(pl.Float64) == 0))
+            & (pl.col("mcc_code").is_null() | (pl.col("mcc_code").str == ""))
+            & (pl.col("pos_cd").is_null())# | (pl.col("pos_cd") == ""))
+        )
+        .then(pl.lit(0))
+        .when(
+            (pl.col("mcc_code").is_not_null() & (pl.col("mcc_code").str != ""))
+            | (pl.col("pos_cd").is_not_null())# & (pl.col("pos_cd") != ""))
+        )
+        .then(pl.lit(1))
+        .otherwise(pl.lit(2))
         .cast(pl.Int8)
-        .alias("tx_type_group"),
-    ])
+    )
+
+    lf = (
+        lf
+            .join(tx_key_map_lf, on=TX_KEY_COLS, how="left")
+            .with_columns(
+                pl.coalesce(
+                    [pl.col("tx_type_group"), fallback_tx_group_expr,]
+                ).cast(pl.Int8)
+                .alias("tx_type_group"),
+            )
+    )
+
 
     # ── Model routing group ────────────────────────────────────────────────────
     # Splits nonpayment into two sub-groups based on event_type_nm because the

@@ -1,5 +1,7 @@
 import polars as pl
 from polars import col
+from pathlib import Path
+import shutil
 
 # Bayesian smoothing strength (pseudo-observation count).
 # With ~300 labeled rows per event_desc value on average, alpha=20 pulls
@@ -7,9 +9,81 @@ from polars import col
 _ALPHA = 20
 
 
+TX_KEY_COLS = [
+    "channel_indicator_type",
+    "channel_indicator_sub_type",
+    "event_type_nm",
+    "event_desc",
+]
+TX_KEY_MAP_FILENAME = "transaction_type_key_map.parquet"
+TX_KEY_MAP_PATH = Path(__file__).resolve().parent / "../../../data/misc" / TX_KEY_MAP_FILENAME
+
+
+def learn_transaction_type_keys(history_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Learn transaction type grouping from historical data using a composite key.
+
+    Rules by key:
+        0 = non-payment:
+            all rows with this key have no operaton_amt, no mcc_code, no pos_cd
+        1 = card:
+            all rows with this key have mcc_code or pos_cd
+        2 = p2p / other payment:
+            everything else
+    """
+    has_amt_expr = pl.col("operaton_amt").is_not_null() & (pl.col("operaton_amt").cast(pl.Float64) > 0)
+    has_mcc_expr = pl.col("mcc_code").is_not_null() & (pl.col("mcc_code").str != "")
+    has_pos_expr = pl.col("pos_cd").is_not_null()# & (pl.col("pos_cd") != "")
+    has_card_marker_expr = has_mcc_expr | has_pos_expr
+
+    key_map_lf = (
+        history_lf
+        .select(
+            TX_KEY_COLS
+            + [
+                has_amt_expr.alias("has_amt"),
+                has_mcc_expr.alias("has_mcc"),
+                has_pos_expr.alias("has_pos"),
+                has_card_marker_expr.alias("has_card_marker"),
+            ]
+        )
+        .group_by(TX_KEY_COLS)
+        .agg([
+            pl.col("has_amt").sum().alias("amt_cnt"),
+            pl.col("has_mcc").sum().alias("mcc_cnt"),
+            pl.col("has_pos").sum().alias("pos_cnt"),
+            pl.col("has_card_marker").sum().alias("card_marker_cnt"),
+            pl.len().alias("key_row_cnt"),
+        ])
+        .with_columns([
+            pl.when(
+                (pl.col("amt_cnt") == 0)
+                & (pl.col("mcc_cnt") == 0)
+                & (pl.col("pos_cnt") == 0)
+            )
+            .then(pl.lit(0))
+            .when(
+                pl.col("card_marker_cnt") > 0#== pl.col("key_row_cnt")
+            )
+            .then(pl.lit(1))
+            .otherwise(pl.lit(2))
+            .cast(pl.Int8)
+            .alias("tx_type_group"),
+        ])
+        .select(TX_KEY_COLS + ["tx_type_group"])
+    )
+
+    output_path = Path(TX_KEY_MAP_PATH)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    key_map_lf.collect().write_parquet(output_path)
+
+    return key_map_lf
+
+
 def compute_global_stats(
     train_lf: pl.LazyFrame,
     labels_lf: pl.LazyFrame | None = None,
+    # key_map_lf: pl.LazyFrame | None = None,
 ) -> dict[str, pl.LazyFrame]:
     """
     Compute population-level frequency tables from the TRAINING set only.
@@ -131,6 +205,9 @@ def compute_global_stats(
         .agg(pl.len().alias("global_subchannel_freq"))
     )
 
+    # learn tx_type_groups on train+pretrain data
+    tx_key_map_lf = learn_transaction_type_keys(train_lf)
+
     # ── Bayesian-smoothed target encodings ────────────────────────────────────
     # Requires labels_lf (event_id → target).  Skipped when not provided.
     if labels_lf is not None:
@@ -146,14 +223,20 @@ def compute_global_stats(
         # during feature engineering, so it is absent from the raw transaction
         # LazyFrame passed here.  Derive it inline using the same logic so the
         # within-group channel encodings can group_by it.
-        labeled_tx = labeled_tx.with_columns(
-            pl.when(col("operaton_amt").is_null())
-            .then(pl.lit(0))
-            .when(col("mcc_code").is_not_null() & (col("mcc_code") != ""))
-            .then(pl.lit(1))
-            .otherwise(pl.lit(2))
-            .cast(pl.Int8)
-            .alias("tx_type_group")
+        
+        # labeled_tx = labeled_tx.with_columns(
+        #     pl.when(col("operaton_amt").is_null())
+        #     .then(pl.lit(0))
+        #     .when(col("mcc_code").is_not_null() & (col("mcc_code") != ""))
+        #     .then(pl.lit(1))
+        #     .otherwise(pl.lit(2))
+        #     .cast(pl.Int8)
+        #     .alias("tx_type_group")
+        # )
+
+        labeled_tx = (
+            labeled_tx
+                .join(tx_key_map_lf, on=TX_KEY_COLS, how="left")
         )
 
         # Global fraud rate — used as the Bayesian prior mean.
