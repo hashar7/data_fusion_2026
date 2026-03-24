@@ -16,6 +16,7 @@ def add_device_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             .fill_null(100)
             < 15
         ).then(1).otherwise(0).cast(pl.Int8).alias("low_battery_flag"),
+        col("browser_language").is_not_null().cast(pl.Int8).alias("browser_language_flag"),
     ])
 
     lf = lf.with_columns([
