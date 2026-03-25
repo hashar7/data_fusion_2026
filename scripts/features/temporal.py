@@ -52,8 +52,6 @@ def add_temporal_features(
         # precisely than burst_flag (which only looks at the immediately preceding gap)
         col("time_since_last_tx_minutes").shift(1).rolling_min(window_size=10, min_periods=1).over("customer_id").fill_null(0).alias("time_gap_min_10tx"),
         col("operating_system_is_new").alias("new_device_flag"),
-        col("mcc_is_new_for_user").alias("new_mcc_flag"),
-        (col("channel_indicator_type").cum_count().over(["customer_id", "channel_indicator_type"]) - 1 == 0).cast(pl.Int8).alias("new_channel_flag"),
         (col("mcc_freq_user_cum") / col("tx_count_lifetime")).fill_null(0).alias("merchant_entropy_user"),
     ])
 
@@ -69,7 +67,6 @@ def add_temporal_features(
     ])
 
     lf = lf.with_columns([
-        when((col("is_night") == 1) & (col("new_device_flag") == 1)).then(1).otherwise(0).cast(pl.Int8).alias("new_device_and_night_flag"),
         when((col("web_rdp_connection_flag") == 1) & (col("amount_clean") > 1000)).then(1).otherwise(0).cast(pl.Int8).alias("rdp_and_large_amount_flag"),
         (
             (col("amount_clean").cum_sum().over(["customer_id", "channel_indicator_type"]) - col("amount_clean")) /

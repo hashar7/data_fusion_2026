@@ -1,43 +1,123 @@
 import polars as pl
 from polars import col, when
-from scripts.features._helpers import get_rolling_stats
+
+
+# Time windows for rolling statistics.
+_WINDOWS = [
+    ("15m", "15m"),
+    ("1h",  "1h"),
+    ("6h",  "6h"),
+    ("12h", "12h"),
+    ("1d",  "1d"),
+    ("3d",  "3d"),
+    ("7d",  "7d"),
+    ("30d", "30d"),
+    ("90d", "90d"),
+]
+
+
+def _inline_rolling_exprs(window_size: str, suffix: str) -> list[pl.Expr]:
+    """Inline rolling_*_by() expressions for one window — no join required.
+
+    Uses the Polars 1.x rolling_*_by() API with .over("customer_id") to
+    compute per-customer rolling aggregations directly as column expressions.
+    This avoids creating separate LazyFrames and joining them back.
+    """
+    kw = dict(window_size=window_size, closed="left", min_periods=1)
+    by = "event_dttm"
+    grp = "customer_id"
+    return [
+        col("amount_clean").rolling_mean_by(by, **kw).over(grp)
+            .alias(f"amount_mean_{suffix}"),
+        col("amount_clean").rolling_std_by(by, **kw).over(grp)
+            .alias(f"amount_std_{suffix}"),
+        col("amount_clean").rolling_median_by(by, **kw).over(grp)
+            .alias(f"amount_median_{suffix}"),
+        col("amount_clean").rolling_max_by(by, **kw).over(grp)
+            .alias(f"amount_max_{suffix}"),
+        col("amount_clean").rolling_min_by(by, **kw).over(grp)
+            .alias(f"amount_min_{suffix}"),
+        col("amount_clean").rolling_sum_by(by, **kw).over(grp)
+            .fill_null(0.0).alias(f"cumulative_spend_{suffix}"),
+        col("amount_card").rolling_sum_by(by, **kw).over(grp)
+            .fill_null(0.0).alias(f"card_spend_{suffix}"),
+        col("amount_p2p").rolling_sum_by(by, **kw).over(grp)
+            .fill_null(0.0).alias(f"p2p_spend_{suffix}"),
+        # tx_count: rolling count via sum-of-ones (no rolling_count_by in Polars)
+        col("event_dttm").is_not_null().cast(pl.Int32)
+            .rolling_sum_by(by, **kw).over(grp)
+            .fill_null(0).alias(f"tx_count_{suffix}"),
+    ]
+
+
+def _build_nunique_table(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Compute n_unique (diversity) features via grouped .rolling().
+
+    n_unique has no rolling_*_by() equivalent, so we use the grouped API.
+    All 9 windows are merged into one wide table keyed by temp_row_idx,
+    producing a single join to the main LazyFrame (instead of 9 joins).
+    """
+    merged = None
+    for window_size, suffix in _WINDOWS:
+        feat_names = [
+            f"channel_diversity_{suffix}",
+            f"device_diversity_{suffix}",
+            f"merchant_diversity_{suffix}",
+            f"event_desc_diversity_{suffix}",
+            f"event_type_diversity_{suffix}",
+        ]
+        r = (
+            lf.rolling(
+                index_column="event_dttm",
+                period=window_size,
+                by="customer_id",
+                closed="left",
+            )
+            .agg([
+                col("channel_indicator_type").n_unique().alias(feat_names[0]),
+                col("operating_system_type").n_unique().alias(feat_names[1]),
+                col("mcc_code").n_unique().alias(feat_names[2]),
+                col("event_desc").n_unique().alias(feat_names[3]),
+                col("event_type_nm").n_unique().alias(feat_names[4]),
+            ])
+            .with_row_index("temp_row_idx")
+            .select(["temp_row_idx"] + feat_names)
+        )
+        if merged is None:
+            merged = r
+        else:
+            merged = merged.join(r, on="temp_row_idx", how="left")
+    return merged
 
 
 def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Section D: Rolling Statistics (Lazy-compatible)."""
-    # Sub-day windows — useful for burst / velocity fraud signals
-    r15m = get_rolling_stats(lf, "15m", "15m")
-    r1h  = get_rolling_stats(lf, "1h",  "1h")
-    r6h  = get_rolling_stats(lf, "6h",  "6h")
-    r12h = get_rolling_stats(lf, "12h", "12h")
-    # Day+ windows — useful for longer-horizon behavioural baselines
-    r1d  = get_rolling_stats(lf, "1d",  "1d")
-    r3d  = get_rolling_stats(lf, "3d",  "3d")
-    r7d  = get_rolling_stats(lf, "7d",  "7d")
-    r30d = get_rolling_stats(lf, "30d", "30d")
-    r90d = get_rolling_stats(lf, "90d", "90d")
+    """Section D: Rolling Statistics (optimized inline approach).
 
-    lf = lf.join(r15m, on="temp_row_idx", how="left")
-    lf = lf.join(r1h,  on="temp_row_idx", how="left")
-    lf = lf.join(r6h,  on="temp_row_idx", how="left")
-    lf = lf.join(r12h, on="temp_row_idx", how="left")
-    lf = lf.join(r1d,  on="temp_row_idx", how="left")
-    lf = lf.join(r3d,  on="temp_row_idx", how="left")
-    lf = lf.join(r7d,  on="temp_row_idx", how="left")
-    lf = lf.join(r30d, on="temp_row_idx", how="left")
-    lf = lf.join(r90d, on="temp_row_idx", how="left")
+    Simple aggregations (sum, mean, std, median, min, max) use inline
+    rolling_*_by() expressions — no intermediate LazyFrames or joins.
+    Only n_unique (diversity) features use the grouped .rolling() path
+    because Polars has no rolling_n_unique_by(). All n_unique results
+    are merged into a single join (was 9 separate joins before).
+    """
+    # ── 1. n_unique (diversity) features via grouped rolling ─────────────
+    # Compute first from the simpler LF (before inline columns are added).
+    nq_table = _build_nunique_table(lf)
+    lf = lf.join(nq_table, on="temp_row_idx", how="left")
+
+    # ── 2. Inline rolling aggregations for all 9 windows ────────────────
+    # All sum/mean/std/median/min/max use rolling_*_by() + .over().
+    all_rolling_exprs = []
+    for window_size, suffix in _WINDOWS:
+        all_rolling_exprs.extend(_inline_rolling_exprs(window_size, suffix))
+    lf = lf.with_columns(all_rolling_exprs)
 
     EPS = 1e-9
 
-    # ── Sub-day derived features ──────────────────────────────────────────────
-    # Burst flags: multiple transactions in a very short window is a strong
-    # fraud signal (card-testing, rapid credential abuse, etc.).
+    # ── Sub-day derived features ──────────────────────────────────────────
     lf = lf.with_columns([
-        (col("tx_count_15m") > 2).cast(pl.Int8).alias("burst_flag_15m"),
         (col("tx_count_1h")  > 5).cast(pl.Int8).alias("burst_flag_1h"),
 
-        # Spend ratios: what fraction of the daily spend happened in the last
-        # 15 min / 1 h / 6 h / 12 h?  High ratios signal a sudden burst.
+        # Spend ratios: fraction of daily spend in short sub-windows.
         (col("cumulative_spend_15m") / (col("cumulative_spend_1d").fill_null(0) + EPS)).alias("spend_ratio_15m_vs_1d"),
         (col("cumulative_spend_1h")  / (col("cumulative_spend_1d").fill_null(0) + EPS)).alias("spend_ratio_1h_vs_1d"),
         (col("cumulative_spend_6h")  / (col("cumulative_spend_1d").fill_null(0) + EPS)).alias("spend_ratio_6h_vs_1d"),
@@ -47,13 +127,12 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         (col("tx_count_15m") / (col("tx_count_1h").fill_null(0) + EPS)).alias("tx_count_ratio_15m_vs_1h"),
         (col("tx_count_1h")  / (col("tx_count_1d").fill_null(0) + EPS)).alias("tx_count_ratio_1h_vs_1d"),
 
-        # Amount vs. short-window mean: is the current transaction unusually
-        # large relative to the last hour's activity?
+        # Amount vs. short-window mean.
         (col("amount_clean") / (col("amount_mean_1h").fill_null(1) + EPS)).alias("amount_ratio_to_mean_1h"),
         (col("amount_clean") / (col("amount_mean_6h").fill_null(1) + EPS)).alias("amount_ratio_to_mean_6h"),
     ])
 
-    # ── Day+ derived features ─────────────────────────────────────────────────
+    # ── Day+ derived features ─────────────────────────────────────────────
     lf = lf.with_columns([
         (
             (col("amount_clean") - col("amount_min_7d")) /
@@ -79,42 +158,29 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         (col("amount_clean") - col("amount_clean").shift(1).over("customer_id")).fill_null(0).alias("amount_diff_from_prev"),
         (col("amount_clean") / col("amount_clean").shift(1).over("customer_id").fill_null(1)).alias("amount_ratio_prev"),
         when(col("time_since_last_tx_minutes") < 5).then(1).otherwise(0).cast(pl.Int8).alias("burst_flag"),
-        # Spend ratios: what fraction of long-term spend happened in a short recent window?
-        # The model already uses spend_1d and spend_90d independently (#1 and #3 features);
-        # the ratio makes the normalised deviation explicit and easier to split on.
         (col("cumulative_spend_1d") / (col("cumulative_spend_30d").fill_null(0) + 1e-9)).alias("spend_ratio_1d_vs_30d"),
         (col("cumulative_spend_1d") / (col("cumulative_spend_90d").fill_null(0) + 1e-9)).alias("spend_ratio_1d_vs_90d"),
         (col("cumulative_spend_7d") / (col("cumulative_spend_90d").fill_null(0) + 1e-9)).alias("spend_ratio_7d_vs_90d"),
-        # Per-window spend velocity (complement to the existing spend_velocity_1d=spend_30d/30)
         (col("cumulative_spend_7d")  / 7.0 ).alias("spend_velocity_7d"),
         (col("cumulative_spend_30d") / 30.0).alias("spend_velocity_30d"),
     ])
 
-    # Percentile threshold flags: binary markers for "exceptionally high" transactions.
-    # amount_rank_percentile_90d is already rank-18; these give the model clean binary
-    # splits at the extreme tail without requiring it to learn the threshold itself.
     lf = lf.with_columns([
         (col("amount_rank_percentile_30d") > 0.95).cast(pl.Int8).alias("amount_top5pct_30d"),
         (col("amount_rank_percentile_90d") > 0.99).cast(pl.Int8).alias("amount_top1pct_90d"),
-        # New personal spending record: amount exceeds any transaction in prior 90 days
         (col("amount_clean") > col("amount_max_90d").fill_null(0)).cast(pl.Int8).alias("amount_above_personal_max_flag"),
     ])
 
     # Per-channel cumulative stats (leakage-free: prior rows only, same -1 shift).
-    # global_channel_freq is rank-13; these add the personal dimension: how much does
-    # THIS customer typically use this channel, and is this transaction unusual for them?
     lf = lf.with_columns([
         (col("amount_clean").cum_sum().over(["customer_id", "channel_indicator_type"]) - col("amount_clean")).fill_null(0).alias("spend_in_channel_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "channel_indicator_type"]) - 1).alias("tx_count_in_channel_lifetime"),
         (col("amount_clean").cum_sum().over(["customer_id", "channel_type_subtype"]) - col("amount_clean")).fill_null(0).alias("spend_in_channel_type_subtype_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "channel_type_subtype"]) - 1).alias("tx_count_in_channel_type_subtype_lifetime"),
-        # evtype_channel
         (col("amount_clean").cum_sum().over(["customer_id", "evtype_channel"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_channel_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "evtype_channel"]) - 1).alias("tx_count_in_evtype_channel_lifetime"),
-        # evtype_subchannel
         (col("amount_clean").cum_sum().over(["customer_id", "evtype_subchannel"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_subchannel_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "evtype_subchannel"]) - 1).alias("tx_count_in_evtype_subchannel_lifetime"),
-        # evtype_mcc (two-column over since mcc_code is String)
         (col("amount_clean").cum_sum().over(["customer_id", "event_type_nm", "mcc_code"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_mcc_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "event_type_nm", "mcc_code"]) - 1).alias("tx_count_in_evtype_mcc_lifetime"),
     ])
@@ -128,11 +194,8 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
 
     EPS_CARD = 1e-9
 
-    # ── Card vs P2P spend fractions and cross-window ratios ──────────────────
-    # Captures shifts in the payment type mix: a sudden move to mostly P2P
-    # (or exclusively card) after a stable history is a strong fraud signal.
+    # ── Card vs P2P spend fractions and cross-window ratios ──────────────
     lf = lf.with_columns([
-        # Fraction of window spend that was card vs P2P
         (col("card_spend_1d")  / (col("cumulative_spend_1d").fill_null(0)  + EPS_CARD)).alias("card_fraction_1d"),
         (col("p2p_spend_1d")   / (col("cumulative_spend_1d").fill_null(0)  + EPS_CARD)).alias("p2p_fraction_1d"),
         (col("card_spend_7d")  / (col("cumulative_spend_7d").fill_null(0)  + EPS_CARD)).alias("card_fraction_7d"),
@@ -149,7 +212,7 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         (col("card_spend_7d") / (col("card_spend_90d").fill_null(0) + EPS_CARD)).alias("card_spend_ratio_7d_vs_90d"),
         (col("p2p_spend_7d")  / (col("p2p_spend_90d").fill_null(0)  + EPS_CARD)).alias("p2p_spend_ratio_7d_vs_90d"),
 
-        # Card-to-P2P balance ratio: high value = mostly card, low = mostly P2P
+        # Card-to-P2P balance ratio
         (col("card_spend_1d")  / (col("p2p_spend_1d").fill_null(0)  + EPS_CARD)).alias("card_vs_p2p_ratio_1d"),
         (col("card_spend_30d") / (col("p2p_spend_30d").fill_null(0) + EPS_CARD)).alias("card_vs_p2p_ratio_30d"),
         (col("card_spend_90d") / (col("p2p_spend_90d").fill_null(0) + EPS_CARD)).alias("card_vs_p2p_ratio_90d"),

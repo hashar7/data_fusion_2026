@@ -40,10 +40,7 @@ def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         col("amount_clean").abs().alias("amount_abs"),
         (col("amount_clean") % 100 == 0).cast(pl.Int8).alias("amount_round_100"),
         (col("amount_clean") % 1000 == 0).cast(pl.Int8).alias("amount_round_1000"),
-        (col("amount_clean") % 1 == 0).cast(pl.Int8).alias("amount_is_integer"),
-        col("operaton_amt").is_null().cast(pl.Int8).alias("amount_missing_flag"),
         when(col("currency_iso_cd").is_null()).then(1).otherwise(0).cast(pl.Int8).alias("amount_currency_mismatch_flag"),
-        lit(None).cast(pl.Float64).alias("amount_usd_normalized"),
         # Calendar position — fraudsters tend to strike near paydays / month boundaries
         col("day_of_month").is_in([1, 2, 3]).cast(pl.Int8).alias("is_month_start"),
         col("day_of_month").is_in([28, 29, 30, 31]).cast(pl.Int8).alias("is_month_end"),

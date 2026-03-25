@@ -41,6 +41,7 @@ def process_partition(
     batch_ids: list,
     global_stats: dict | None = None,
     train_only: bool = True,
+    labels_lf: pl.LazyFrame | None = None,
 ) -> pl.DataFrame:
     """
     Process one customer batch end-to-end and return the result as a DataFrame.
@@ -61,9 +62,14 @@ def process_partition(
                    If None, per-customer cumulative counts are used as a proxy.
     train_only   : If True (default), only rows with is_train == 1 are returned.
                    Set to False to keep pretest/test rows as well.
+    labels_lf    : Optional LazyFrame with (event_id, target) for label-feedback
+                   features.  When provided, per-customer cumulative label
+                   statistics are computed (Section K).
     """
     batch_lf    = lf.filter(col("customer_id").is_in(batch_ids))
-    featured_lf = generate_fraud_features_v4(batch_lf, global_stats=global_stats)
+    featured_lf = generate_fraud_features_v4(
+        batch_lf, global_stats=global_stats, labels_lf=labels_lf,
+    )
 
     if train_only:
         featured_lf = featured_lf.filter(col("is_train") == 1)

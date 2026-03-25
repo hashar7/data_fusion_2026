@@ -19,6 +19,7 @@ def build_processed_dataset(
     n_partitions: int = N_PARTITIONS,
     global_stats: dict[str, pl.LazyFrame] | None = None,
     train_only: bool = True,
+    labels_lf: pl.LazyFrame | None = None,
 ) -> None:
     """
     Process pretrain+train data into per-partition parquet files with all
@@ -42,6 +43,8 @@ def build_processed_dataset(
                     compute_global_stats(). Strongly recommended.
     train_only    : If True (default), only is_train==1 rows are written.
                     Pass False to also retain pretest/test rows in output.
+    labels_lf     : Optional LazyFrame with (event_id, target) for label-feedback
+                    features (Section K).
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -63,7 +66,9 @@ def build_processed_dataset(
     for i, batch_ids in enumerate(partitions):
         t_start = time.perf_counter()
 
-        result = process_partition(lf, batch_ids, global_stats, train_only=train_only)
+        result = process_partition(
+            lf, batch_ids, global_stats, train_only=train_only, labels_lf=labels_lf,
+        )
         n_rows = len(result)
         total_rows_written += n_rows
 

@@ -49,20 +49,14 @@ def add_zscore_features(
         (col("operating_system_type") != col("operating_system_type").shift(1).over("customer_id")).cast(pl.Int8).fill_null(0).alias("os_change_flag"),
         (col("timezone") != col("timezone").shift(1).over("customer_id")).cast(pl.Int8).fill_null(0).alias("timezone_change_flag"),
         (col("time_since_last_tx_minutes") < 5).cast(pl.Int8).alias("rapid_sequence_flag"),
-        (col("device_risk_score") > 1).cast(pl.Int8).alias("suspicious_env_flag"),
     ])
 
     lf = lf.with_columns([
-        (col("global_mcc_freq") < 100).cast(pl.Int8).alias("mcc_rare_global_flag"),
-        (col("global_combination_freq") < 10).cast(pl.Int8).alias("rare_combination_flag"),
         (col("operating_system_is_new") & (s_num("operaton_amt") > 1000)).cast(pl.Int8).alias("device_change_and_large_amount_flag"),
-        (col("phone_voip_call_flag") & col("mcc_is_new_for_user")).cast(pl.Int8).alias("voip_and_new_mcc_flag"),
-        (col("compromised_flag") & (s_num("operaton_amt") > col("amount_mean_7d") * 2)).cast(pl.Int8).alias("compromised_and_high_amount_flag"),
         (col("session_first_tx_flag") & (s_num("operaton_amt") > 1000)).cast(pl.Int8).alias("session_first_tx_large_flag"),
         (col("timezone") - col("timezone").shift(1).over("customer_id")).abs().fill_null(0).alias("geo_jump_proxy"),
         (col("device_diversity_30d") / col("tx_count_30d").fill_null(1)).fill_null(0).alias("device_entropy_ratio"),
         (s_str("accept_language") != s_str("browser_language")).cast(pl.Int8).alias("language_mismatch"),
-        col("timezone").is_null().cast(pl.Int8).alias("timezone_mismatch"),
         ((col("event_dttm") - col("event_dttm").shift(1).over("customer_id")).dt.total_days()).fill_null(999).alias("merchant_last_seen_days"),
         ((col("event_dttm") - col("event_dttm").shift(1).over(["customer_id", "mcc_code"])).dt.total_days()).fill_null(999).alias("mcc_last_seen_days"),
     ])

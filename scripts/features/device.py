@@ -55,11 +55,6 @@ def add_device_features(lf: pl.LazyFrame) -> pl.LazyFrame:
     lf = lf.with_columns([
         # Average spend per transaction so far in this session
         (col("session_amount_sum") / col("session_tx_count").clip(lower_bound=1)).fill_null(0).alias("session_avg_amount"),
-        # Compromised device × how many times larger than 30d mean this transaction is
-        (
-            col("compromised_flag").cast(pl.Float64) *
-            col("amount_clean") / (col("amount_mean_30d").fill_null(1) + 1e-9)
-        ).alias("compromised_x_amount_ratio"),
         # RDP session depth: remote-controlled device × how deep into the session we are
         (col("web_rdp_connection_flag").cast(pl.Float64) * col("session_tx_count").cast(pl.Float64)).alias("rdp_x_session_depth"),
     ])
