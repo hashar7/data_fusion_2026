@@ -5,7 +5,7 @@ Change values here — no other file needs to be touched for config changes.
 import os
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-LABELS_PATH     = "../../data/train_labels.parquet"
+LABELS_PATH     = "../../data/raw/train_labels.parquet"
 FEATURES_DIR    = "../data_processed"   # ALL periods in one directory
 STAGING_DIR     = "../data_splits"
 SUBMISSION_PATH = "submission.csv"
@@ -125,3 +125,28 @@ CATBOOST_PARAMS_BY_GROUP: dict = {}
 LGBM_MODEL_PATH_FMT     = "model_{name}_s{seed_idx}.txt"
 CATBOOST_MODEL_PATH_FMT = "model_{name}_catboost.cbm"
 CALIBRATOR_PATH_FMT     = "calibrator_{name}.pkl"
+
+
+# ── F vs G random forrest config ────────────────────────────────────────────────
+
+RF_N_JOBS = -1
+RF_CV_N_SPLITS = 8
+RF_CV_SEED = 42
+RF_MODEL_FILENAME = "model_rf_fg.pkl"
+
+# Fixed RF settings
+RF_BASE_PARAMS = {
+    "bootstrap": True,
+    "class_weight": "balanced_subsample",
+    "random_state": RF_CV_SEED,
+    "n_jobs": RF_N_JOBS
+}
+
+# Hyperparameter plane for 6-fold CV
+RF_PARAM_GRID = {
+    "n_estimators": [1000, 1500],
+    "max_depth": [14, 20, None],
+    "min_samples_split": [2, 20],
+    "min_samples_leaf": [1],
+    "max_features": ['sqrt'],
+}

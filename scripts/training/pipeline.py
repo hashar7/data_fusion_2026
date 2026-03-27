@@ -5,10 +5,12 @@ import os
 import re
 import time
 from datetime import datetime
+import joblib
 
 import numpy as np
 from sklearn.metrics import average_precision_score
 
+# ── tx_type_group based models ────────────────────────────────────────────────––––
 from scripts.training.config import (
     FEATURES_DIR, STAGING_DIR, SUBMISSION_PATH, MODELS_DIR,
     VAL_CUTOFF_DATE, TRAIN_END_DATE, TX_TYPE_GROUPS,
@@ -26,6 +28,17 @@ from scripts.training.train_catboost import train_catboost_model
 from scripts.training.evaluate import evaluate
 from scripts.training.predict import score_test
 
+# ── F vs G Random Forrest ────────────────────────────────────────────────–––––––––
+from scripts.training.train_rf import (
+    build_labeled_train_indices,
+    tune_rf_hyperparameters,
+    train_rf_model,
+    sanitize_rf_features,
+)
+from scripts.training.config import (
+    RF_MODEL_FILENAME,
+)
+
 
 def _prepare_models_dir(models_dir: str) -> None:
     """
@@ -39,10 +52,13 @@ def _prepare_models_dir(models_dir: str) -> None:
     # Collect unversioned model files — anything that does NOT already have _ver_N
     all_files = (
         glob.glob(os.path.join(models_dir, "model_*.txt")) +
-        glob.glob(os.path.join(models_dir, "model_*.cbm"))
+        glob.glob(os.path.join(models_dir, "model_*.cbm")) +
+        glob.glob(os.path.join(models_dir, "model_*.pkl"))
     )
-    unversioned = [f for f in all_files
-                   if not re.search(r"_ver_\d+\.(txt|cbm)$", f)]
+    unversioned = [
+        f for f in all_files
+        if not re.search(r"_ver_\d+\.(txt|cbm|pkl)$", f)
+    ]
 
     if not unversioned:
         return
@@ -50,11 +66,12 @@ def _prepare_models_dir(models_dir: str) -> None:
     # Find the highest existing version number so we don't collide
     versioned = (
         glob.glob(os.path.join(models_dir, "model_*_ver_*.txt")) +
-        glob.glob(os.path.join(models_dir, "model_*_ver_*.cbm"))
+        glob.glob(os.path.join(models_dir, "model_*_ver_*.cbm")) +
+        glob.glob(os.path.join(models_dir, "model_*_ver_*.pkl"))
     )
     max_ver = 0
     for f in versioned:
-        m = re.search(r"_ver_(\d+)\.(txt|cbm)$", f)
+        m = re.search(r"_ver_(\d+)\.(txt|cbm|pkl)$", f)
         if m:
             max_ver = max(max_ver, int(m.group(1)))
 
@@ -324,3 +341,170 @@ def train_baseline() -> None:
     print(f"Total wall time  : {_fmt(time.perf_counter() - total_start)}")
     print(f"Combined PR-AUC  : {combined_pr_auc:.6f}")
     print("─" * 65)
+
+
+def train_rf_fg() -> None:
+    """
+    Train RandomForest on labeled F/G rows only.
+
+    Reuses existing memmaps:
+        X_train, y_train, X_val, y_val, is_labeled_val, memmap_meta
+
+    Steps:
+        1. Reload or build memmaps
+        2. Reconstruct labeled-train row indices by rescanning processed parquet partitions
+        3. Load only labeled train/val rows into RAM
+        4. Tune RF with 6-fold CV on labeled-train rows
+        5. Fit best RF on labeled-train rows and evaluate on labeled val rows
+        6. Refit RF on labeled train + labeled val rows
+        7. Report optimistic PR-AUC on val after refit
+        8. Save final model bundle to MODELS_DIR
+    """
+    total_start = time.perf_counter()
+    cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
+    train_end = datetime.fromisoformat(TRAIN_END_DATE)
+
+    # _prepare_models_dir(MODELS_DIR)
+
+    files = _parquet_files(FEATURES_DIR)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
+    print(f"Found {len(files)} parquet partitions in {FEATURES_DIR!r}\n", flush=True)
+
+    cached = _load_cache(STAGING_DIR)
+    if cached is not None:
+        X_train, y_train, X_val, y_val, il_val, tg_train, tg_val, feature_cols = cached
+    else:
+        labels = load_labels()
+        n_train, n_val = count_rows(files, cutoff, train_end)
+        (
+            X_train, y_train, X_val, y_val, il_val,
+            tg_train, tg_val, feature_cols
+        ) = build_memmaps(
+            files, labels, cutoff, train_end, n_train, n_val, STAGING_DIR
+        )
+        del labels
+        gc.collect()
+
+    print(f"  Feature columns : {len(feature_cols)}")
+    print(f"  X_train shape   : {X_train.shape}")
+    print(f"  X_val shape     : {X_val.shape}\n")
+
+    # We need original labels again to identify F/G rows inside train.
+    labels = load_labels()
+
+    # ── Build train labeled mapping (F/G only) ──────────────────────────────
+    train_labeled_idx = build_labeled_train_indices(files, labels, cutoff)
+    if len(train_labeled_idx) == 0:
+        raise RuntimeError("No labeled train rows found for RF training.")
+
+    # ── Val labeled mapping already exists in cache as il_val ───────────────
+    il_val_np = np.asarray(il_val)
+    val_labeled_idx = np.flatnonzero(il_val_np == 1)
+
+    if len(val_labeled_idx) == 0:
+        raise RuntimeError("No labeled val rows found for RF validation.")
+
+    print("Loading labeled train/val subsets into RAM …", flush=True)
+
+    X_train_fg = np.asarray(X_train[train_labeled_idx], dtype=np.float32)
+    y_train_fg = np.asarray(y_train[train_labeled_idx], dtype=np.int8)
+
+    X_val_fg = np.asarray(X_val[val_labeled_idx], dtype=np.float32)
+    y_val_fg = np.asarray(y_val[val_labeled_idx], dtype=np.int8)
+
+    X_train_fg = sanitize_rf_features(
+        X_train_fg,
+        feature_cols=feature_cols,
+        stage="X_train_fg",
+    )
+    X_val_fg = sanitize_rf_features(
+        X_val_fg,
+        feature_cols=feature_cols,
+        stage="X_val_fg",
+    )
+
+    print(f"  Train labeled rows : {len(y_train_fg):,}")
+    print(f"    positives (F)    : {int(y_train_fg.sum()):,}")
+    print(f"    negatives (G)    : {int((y_train_fg == 0).sum()):,}")
+    print(f"  Val labeled rows   : {len(y_val_fg):,}")
+    print(f"    positives (F)    : {int(y_val_fg.sum()):,}")
+    print(f"    negatives (G)    : {int((y_val_fg == 0).sum()):,}\n")
+
+    # ── CV tuning on train only ─────────────────────────────────────────────
+    best_params, cv_results = tune_rf_hyperparameters(
+        X_train_fg,
+        y_train_fg,
+    )
+
+    # ── Best model on train only → true holdout val metric ──────────────────
+    print("Training best RF on labeled train rows …", flush=True)
+    best_train_model = train_rf_model(
+        X_train_fg,
+        y_train_fg,
+        rf_params=best_params,
+    )
+
+    val_scores = best_train_model.predict_proba(X_val_fg)[:, 1].astype(np.float32)
+    val_pr_auc = average_precision_score(y_val_fg, val_scores)
+
+    print(f"\nHoldout val PR-AUC (best RF trained on train only): {val_pr_auc:.6f}\n", flush=True)
+
+    # ── Refit on train + val labeled rows ───────────────────────────────────
+    print("Refitting RF on labeled train + labeled val rows …", flush=True)
+    X_full_fg = np.concatenate([X_train_fg, X_val_fg], axis=0)
+    y_full_fg = np.concatenate([y_train_fg, y_val_fg], axis=0)
+
+    X_full_fg = sanitize_rf_features(
+        X_full_fg,
+        feature_cols=feature_cols,
+        stage="X_full_fg",
+    )
+
+    final_model = train_rf_model(
+        X_full_fg,
+        y_full_fg,
+        rf_params=best_params,
+    )
+
+    final_val_scores = final_model.predict_proba(X_val_fg)[:, 1].astype(np.float32)
+    final_val_pr_auc = average_precision_score(y_val_fg, final_val_scores)
+
+    print(
+        f"PR-AUC after refit on train+val: {final_val_pr_auc:.6f}",
+        flush=True,
+    )
+    # ── Save final model bundle ──────────────────────────────────────────────
+    model_path = os.path.join(MODELS_DIR, RF_MODEL_FILENAME)
+    bundle = {
+        "model": final_model,
+        "feature_cols": feature_cols,
+        "best_params": best_params,
+        "cv_results": cv_results,
+        "holdout_val_pr_auc": float(val_pr_auc),
+        "optimistic_val_pr_auc_after_refit": float(final_val_pr_auc),
+    }
+    joblib.dump(bundle, model_path)
+    print(f"Final RF model bundle saved → {model_path}\n", flush=True)
+
+    del (
+        labels,
+        train_labeled_idx,
+        val_labeled_idx,
+        X_train_fg,
+        y_train_fg,
+        X_val_fg,
+        y_val_fg,
+        X_full_fg,
+        y_full_fg,
+        val_scores,
+        final_val_scores,
+    )
+    gc.collect()
+
+    print(f"{'─' * 65}")
+    print(f"Total wall time : {_fmt(time.perf_counter() - total_start)}")
+    print(f"Holdout val AP  : {val_pr_auc:.6f}")
+    print(f"Refit val AP    : {final_val_pr_auc:.6f}")
+    print(f"{'─' * 65}")
+
