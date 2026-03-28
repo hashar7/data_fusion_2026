@@ -104,8 +104,8 @@ CATBOOST_BLEND_WEIGHT = 0.25   # fraction of CatBoost score in LightGBM+CatBoost
 
 CATBOOST_PARAMS = {
     "iterations":            2000,
-    "learning_rate":         0.05,
-    "depth":                 8,
+    "learning_rate":         0.075,
+    "depth":                 11,
     "l2_leaf_reg":           3.0,
     "loss_function":         "Logloss",
     "eval_metric":           "AUC",
@@ -144,9 +144,14 @@ RF_BASE_PARAMS = {
 
 # Hyperparameter plane for 6-fold CV
 RF_PARAM_GRID = {
-    "n_estimators": [1000, 1500],
-    "max_depth": [14, 20, None],
-    "min_samples_split": [2, 20],
+    "n_estimators": [1500],
+    "max_depth": [20],
+    "min_samples_split": [20],
     "min_samples_leaf": [1],
     "max_features": ['sqrt'],
 }
+
+
+# ── F vs U catboost model ────────────────────────────────────────────────––––––
+
+CATBOOST_FU_MODEL_FILENAME = "model_catboost_fu.cbm"

@@ -8,6 +8,7 @@ from datetime import datetime
 import joblib
 
 import numpy as np
+import polars as pl
 from sklearn.metrics import average_precision_score
 
 # ── tx_type_group based models ────────────────────────────────────────────────––––
@@ -20,6 +21,7 @@ from scripts.training.config import (
     ENSEMBLE_SEEDS,
     CATBOOST_PARAMS, CATBOOST_PARAMS_BY_GROUP, CATBOOST_BLEND_WEIGHT,
     LGBM_MODEL_PATH_FMT, CATBOOST_MODEL_PATH_FMT,
+    CATBOOST_FU_MODEL_FILENAME, UNDERSAMPLE_SEED,
 )
 from scripts.training._utils import _fmt, _parquet_files, _progress
 from scripts.training.data import load_labels, count_rows, build_memmaps, _load_cache
@@ -118,6 +120,83 @@ def _score_val_group(
         _progress(chunk_i + 1, n_chunks, chunk_times, suffix=suffix)
     print()
     return scores
+
+
+def _estimate_matrix_ram_gb(n_rows: int, n_features: int, dtype_bytes: int = 4) -> float:
+    """
+    Estimate dense matrix RAM usage in GB.
+    """
+    return (n_rows * n_features * dtype_bytes) / (1024 ** 3)
+
+
+def _build_fu_train_mask(
+    files: list[str],
+    labels: pl.DataFrame,
+    cutoff: datetime,
+) -> np.ndarray:
+    """
+    Reconstruct a boolean train mask aligned with X_train / y_train memmaps.
+
+    Keep:
+        F rows  -> target == 1
+        U rows  -> target is null after label join
+    Drop:
+        G rows  -> target == 0 in original labels
+    """
+    print("Building F/U train mask from processed parquet partitions …", flush=True)
+
+    labels_small = labels.select(["customer_id", "event_id", "target"])
+    mask_parts: list[np.ndarray] = []
+    wall_times: list[float] = []
+
+    for i, f in enumerate(files):
+        t0 = time.perf_counter()
+
+        chunk = pl.read_parquet(
+            f,
+            columns=["customer_id", "event_id", "event_dttm", "is_train"],
+        )
+
+        if chunk["event_dttm"].dtype == pl.Utf8:
+            chunk = chunk.with_columns(
+                pl.col("event_dttm").str.strptime(pl.Datetime, strict=False)
+            )
+
+        chunk = chunk.join(
+            labels_small,
+            on=["customer_id", "event_id"],
+            how="left",
+        )
+
+        train_chunk = chunk.filter(
+            (pl.col("is_train") == 1) & (pl.col("event_dttm") < cutoff)
+        )
+
+        fu_mask_chunk = (
+            train_chunk["target"].is_null() | (train_chunk["target"] == 1)
+        ).to_numpy()
+
+        mask_parts.append(fu_mask_chunk.astype(bool, copy=False))
+
+        del chunk, train_chunk, fu_mask_chunk
+        gc.collect()
+
+        wall_times.append(time.perf_counter() - t0)
+        _progress(
+            i + 1,
+            len(files),
+            wall_times,
+            suffix=f"assembled train F/U mask rows {sum(len(x) for x in mask_parts):,}",
+        )
+
+    print()
+
+    if not mask_parts:
+        return np.empty(0, dtype=bool)
+
+    train_fu_mask = np.concatenate(mask_parts).astype(bool, copy=False)
+    print(f"  Train F/U mask built: {len(train_fu_mask):,} rows\n", flush=True)
+    return train_fu_mask
 
 
 def train_baseline() -> None:
@@ -508,3 +587,305 @@ def train_rf_fg() -> None:
     print(f"Refit val AP    : {final_val_pr_auc:.6f}")
     print(f"{'─' * 65}")
 
+
+def train_catboost_fu() -> None:
+    """
+    Train CatBoost on F/U events only.
+
+    Train rows:
+        keep F (target=1) and U (not present in original labels)
+        drop G (target=0 in original labels)
+
+    Val rows:
+        keep F and U
+        drop G
+
+    Steps:
+        1. Reload or build memmaps
+        2. Reconstruct F/U train mask from processed parquet partitions
+        3. Build F/U val mask using y_val + is_labeled_val
+        4. Estimate RAM for masked + undersampled train matrix and adjust ratio if needed
+        5. Train CatBoost on train split
+        6. Evaluate on F/U validation subset
+        7. Retrain on train+val combined F/U subset
+        8. Evaluate final model on validation subset
+        9. Save model to MODELS_DIR
+    """
+    total_start = time.perf_counter()
+    cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
+    train_end = datetime.fromisoformat(TRAIN_END_DATE)
+
+    # _prepare_models_dir(MODELS_DIR)
+
+    files = _parquet_files(FEATURES_DIR)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
+    print(f"Found {len(files)} parquet partitions in {FEATURES_DIR!r}\n", flush=True)
+
+    cached = _load_cache(STAGING_DIR)
+    if cached is not None:
+        X_train, y_train, X_val, y_val, il_val, tg_train, tg_val, feature_cols = cached
+    else:
+        labels = load_labels()
+        n_train, n_val = count_rows(files, cutoff, train_end)
+        (
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            il_val,
+            tg_train,
+            tg_val,
+            feature_cols,
+        ) = build_memmaps(
+            files, labels, cutoff, train_end, n_train, n_val, STAGING_DIR
+        )
+        del labels
+        gc.collect()
+
+    print(f"  Feature columns : {len(feature_cols)}")
+    print(f"  X_train shape   : {X_train.shape}")
+    print(f"  X_val shape     : {X_val.shape}\n")
+
+    labels = load_labels()
+
+    # ── Step 1: Build F/U masks ──────────────────────────────────────────────
+    train_fu_mask = _build_fu_train_mask(files, labels, cutoff)
+
+    y_train_np = np.asarray(y_train)
+    y_val_np = np.asarray(y_val)
+    il_val_np = np.asarray(il_val)
+
+    # Keep F or U on val, drop G.
+    val_fu_mask = (y_val_np == 1) | (il_val_np == 0)
+
+    n_train_fu = int(train_fu_mask.sum())
+    n_val_fu = int(val_fu_mask.sum())
+
+    n_train_pos = int(y_train_np[train_fu_mask].sum()) if n_train_fu > 0 else 0
+    n_train_neg = n_train_fu - n_train_pos  # U only
+    n_val_pos = int(y_val_np[val_fu_mask].sum()) if n_val_fu > 0 else 0
+    n_val_neg = n_val_fu - n_val_pos        # U only
+
+    print("F/U subset summary:")
+    print(f"  Train rows : {n_train_fu:,}  |  F positives: {n_train_pos:,}  |  U negatives: {n_train_neg:,}")
+    print(f"  Val rows   : {n_val_fu:,}  |  F positives: {n_val_pos:,}  |  U negatives: {n_val_neg:,}\n")
+
+    if n_train_fu == 0 or n_train_pos == 0:
+        raise RuntimeError("F/U train subset is empty or has zero positives.")
+    if n_val_fu == 0 or n_val_pos == 0:
+        raise RuntimeError("F/U val subset is empty or has zero positives.")
+
+    # ── Step 2: Decide negative sampling ratio based on RAM estimate ────────
+    neg_ratio = NEG_SAMPLE_RATIO
+    n_neg_keep_est = min(n_train_neg, int(n_train_neg * neg_ratio))
+    n_neg_keep_est = max(n_neg_keep_est, n_train_pos)
+    n_rows_fit_est = n_train_pos + n_neg_keep_est
+    est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, len(feature_cols), dtype_bytes=4)
+
+    print("Train matrix RAM estimate after mask + undersampling:")
+    print(f"  NEG_SAMPLE_RATIO candidate : {neg_ratio}")
+    print(f"  Positives kept             : {n_train_pos:,}")
+    print(f"  Negatives kept             : {n_neg_keep_est:,}")
+    print(f"  Final train rows           : {n_rows_fit_est:,}")
+    print(f"  Estimated X RAM            : {est_ram_gb:.3f} GB")
+
+    # Threshold for CatBoost on a 16 GB machine.
+    if est_ram_gb > 10.0:
+        neg_ratio = neg_ratio / 5
+        n_neg_keep_est = min(n_train_neg, int(n_train_pos * neg_ratio))
+        n_rows_fit_est = n_train_pos + n_neg_keep_est
+        est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, len(feature_cols), dtype_bytes=4)
+
+        print("\n  Estimated RAM is heavy - switching NEG_SAMPLE_RATIO to 0.01")
+        print(f"  Adjusted negatives kept    : {n_neg_keep_est:,}")
+        print(f"  Adjusted final train rows  : {n_rows_fit_est:,}")
+        print(f"  Adjusted estimated X RAM   : {est_ram_gb:.3f} GB")
+    print()
+
+    # ── Step 3: Prepare validation subset in RAM ─────────────────────────────
+    print("Loading F/U validation subset into RAM …", flush=True)
+    val_pos_idx = np.flatnonzero(y_val_np == 1)
+    val_u_idx_all = np.flatnonzero((y_val_np == 0) & (il_val_np == 0))
+
+    n_val_pos = len(val_pos_idx)
+    n_val_u = len(val_u_idx_all)
+
+    n_val_u_keep = min(n_val_u, int(n_val_u * neg_ratio))
+    n_val_u_keep = max(n_val_u_keep, n_val_pos)
+
+    rng = np.random.default_rng(UNDERSAMPLE_SEED)
+    if n_val_u_keep < n_val_u:
+        val_u_idx = rng.choice(val_u_idx_all, size=n_val_u_keep, replace=False)
+    else:
+        val_u_idx = val_u_idx_all
+
+    val_fu_idx = np.concatenate([val_pos_idx, val_u_idx])
+    rng.shuffle(val_fu_idx)
+
+    X_val_fu = np.asarray(X_val[val_fu_idx], dtype=np.float32)
+    y_val_fu = np.asarray(y_val_np[val_fu_idx], dtype=np.int8)
+    il_val_ones_fu = np.ones(len(val_fu_idx), dtype=np.int8)
+
+    print("Validation subset after negative subsampling:")
+    print(f"  F positives kept : {n_val_pos:,}")
+    print(f"  U negatives kept : {len(val_u_idx):,}")
+    print(f"  X_val_fu shape : {X_val_fu.shape}")
+    print(f"  y_val_fu rows  : {len(y_val_fu):,}\n")
+
+    # ── Step 4: Train on train split ─────────────────────────────────────────
+    print("=" * 65)
+    print("  CatBoost F/U model - train split")
+    print("=" * 65)
+    print()
+
+    cb_model = train_catboost_model(
+        X_train,
+        y_train,
+        X_val_fu,
+        y_val_fu,
+        il_val_ones_fu,
+        feature_cols,
+        train_row_mask=train_fu_mask,
+        neg_sample_ratio=neg_ratio,
+        catboost_params=CATBOOST_PARAMS,
+    )
+
+    # model_path = os.path.join(MODELS_DIR, CATBOOST_FU_MODEL_FILENAME)
+    # cb_model.save_model(model_path)
+    # print(f"\nCatBoost F/U model saved → {model_path}\n", flush=True)
+
+    print("Scoring F/U validation rows …", flush=True)
+    val_scores = _score_val_group(
+        cb_model,
+        X_val,
+        val_fu_idx,
+        is_catboost=True,
+        suffix="catboost f/u val",
+    )
+    val_pr_auc = average_precision_score(y_val_fu, val_scores)
+    print(f"\nValidation PR-AUC [F/U CatBoost]: {val_pr_auc:.6f}\n", flush=True)
+
+    # ── Step 5: Refit on train + val combined F/U subset ────────────────────
+    print("=" * 65)
+    print("  CatBoost F/U model - train + val combined")
+    print("=" * 65)
+    print()
+
+    train_pos_idx = np.flatnonzero(train_fu_mask & (y_train_np == 1))
+    train_neg_idx_all = np.flatnonzero(train_fu_mask & (y_train_np == 0))
+
+    val_pos_idx = np.flatnonzero(val_fu_mask & (y_val_np == 1))
+    val_neg_idx_all = np.flatnonzero(val_fu_mask & (y_val_np == 0))
+
+    n_pos_full = len(train_pos_idx) + len(val_pos_idx)
+    n_neg_full = len(train_neg_idx_all) + len(val_neg_idx_all)
+    n_neg_keep_full = min(n_neg_full, int(n_neg_full * neg_ratio))
+
+    if n_neg_full > 0 and n_neg_keep_full > 0:
+        share_train = len(train_neg_idx_all) / n_neg_full
+        n_neg_keep_train = min(len(train_neg_idx_all), int(round(n_neg_keep_full * share_train)))
+        n_neg_keep_val = min(len(val_neg_idx_all), n_neg_keep_full - n_neg_keep_train)
+
+        # Fix any rounding remainder.
+        shortfall = n_neg_keep_full - (n_neg_keep_train + n_neg_keep_val)
+        if shortfall > 0:
+            extra_train = min(shortfall, len(train_neg_idx_all) - n_neg_keep_train)
+            n_neg_keep_train += extra_train
+            shortfall -= extra_train
+        if shortfall > 0:
+            extra_val = min(shortfall, len(val_neg_idx_all) - n_neg_keep_val)
+            n_neg_keep_val += extra_val
+
+        rng = np.random.default_rng(UNDERSAMPLE_SEED)
+        train_neg_idx = (
+            rng.choice(train_neg_idx_all, size=n_neg_keep_train, replace=False)
+            if n_neg_keep_train > 0 else np.empty(0, dtype=np.int64)
+        )
+        val_neg_idx = (
+            rng.choice(val_neg_idx_all, size=n_neg_keep_val, replace=False)
+            if n_neg_keep_val > 0 else np.empty(0, dtype=np.int64)
+        )
+    else:
+        train_neg_idx = np.empty(0, dtype=np.int64)
+        val_neg_idx = np.empty(0, dtype=np.int64)
+
+    print("Combined F/U refit subset:")
+    print(f"  Positives kept : {n_pos_full:,}")
+    print(f"  Negatives kept : {len(train_neg_idx) + len(val_neg_idx):,}")
+    print(f"  Total rows     : {n_pos_full + len(train_neg_idx) + len(val_neg_idx):,}\n")
+
+    X_full_fu = np.concatenate(
+        [
+            np.asarray(X_train[train_pos_idx], dtype=np.float32),
+            np.asarray(X_val[val_pos_idx], dtype=np.float32),
+            np.asarray(X_train[train_neg_idx], dtype=np.float32),
+            np.asarray(X_val[val_neg_idx], dtype=np.float32),
+        ],
+        axis=0,
+    )
+
+    y_full_fu = np.concatenate(
+        [
+            np.ones(len(train_pos_idx), dtype=np.int8),
+            np.ones(len(val_pos_idx), dtype=np.int8),
+            np.zeros(len(train_neg_idx), dtype=np.int8),
+            np.zeros(len(val_neg_idx), dtype=np.int8),
+        ],
+        axis=0,
+    )
+
+    rng = np.random.default_rng(UNDERSAMPLE_SEED)
+    perm = rng.permutation(len(y_full_fu))
+    X_full_fu = X_full_fu[perm]
+    y_full_fu = y_full_fu[perm]
+
+    final_cb_model = train_catboost_model(
+        X_full_fu,
+        y_full_fu,
+        X_val_fu,
+        y_val_fu,
+        il_val_ones_fu,
+        feature_cols,
+        train_row_mask=None,
+        neg_sample_ratio=None,
+        catboost_params=CATBOOST_PARAMS,
+    )
+
+    final_model_path = os.path.join(MODELS_DIR, CATBOOST_FU_MODEL_FILENAME)
+    final_cb_model.save_model(final_model_path)
+    print(f"\nFinal CatBoost F/U model saved → {final_model_path}\n", flush=True)
+
+    print("Scoring F/U validation rows with final model …", flush=True)
+    final_val_scores = final_cb_model.predict_proba(X_val_fu)[:, 1].astype(np.float32)
+    final_val_pr_auc = average_precision_score(y_val_fu, final_val_scores)
+    print(f"\nFinal validation PR-AUC [F/U CatBoost]: {final_val_pr_auc:.6f}\n", flush=True)
+
+    del (
+        labels,
+        train_fu_mask,
+        val_fu_mask,
+        X_val_fu,
+        y_val_fu,
+        il_val_ones_fu,
+        val_scores,
+        train_pos_idx,
+        train_neg_idx_all,
+        val_pos_idx,
+        val_neg_idx_all,
+        train_neg_idx,
+        val_neg_idx,
+        X_full_fu,
+        y_full_fu,
+        final_val_scores,
+        y_train_np,
+        y_val_np,
+        il_val_np,
+    )
+    gc.collect()
+
+    print("─" * 65)
+    print(f"Total wall time           : {_fmt(time.perf_counter() - total_start)}")
+    print(f"Validation PR-AUC         : {val_pr_auc:.6f}")
+    print(f"Final validation PR-AUC   : {final_val_pr_auc:.6f}")
+    print("─" * 65)
