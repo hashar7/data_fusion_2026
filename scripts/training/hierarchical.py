@@ -257,7 +257,7 @@ def train_suspicious(
 
     Returns (model, best_iteration, val_pr_auc)
     """
-    print("\nTraining Suspicious Detector (P(labeled | tx)) …", flush=True)
+    print(f"\nTraining Suspicious Detector (P(labeled | tx)) …", flush=True)
 
     # Build train target and weights
     train_df = train_df.copy()
@@ -335,7 +335,7 @@ def train_rgs(
 
     Returns (model, best_iteration, val_pr_auc)
     """
-    print("\nTraining Red|Suspicious Model (P(fraud | labeled, tx)) …", flush=True)
+    print(f"\nTraining Red|Suspicious Model (P(fraud | labeled, tx)) …", flush=True)
 
     # Keep only labeled rows (raw_target != -1)
     labeled_train = train_df[train_df["raw_target"] != -1].copy()
@@ -466,3 +466,91 @@ def refit_model(
     new_model = CatBoostClassifier(**params)
     new_model.fit(pool, verbose=verbose)
     return new_model
+
+
+# ── Main CatBoost (direct fraud prediction) ──────────────────────────────────
+
+def train_main_catboost(
+    train_df: pd.DataFrame,
+    val_labeled_df: pd.DataFrame,
+    all_features: list,
+    cat_features: list,
+    params: dict,
+    red_weight: float = 10.0,
+    yellow_weight: float = 2.5,
+    green_recent_weight: float = 1.5,
+    green_old_weight: float = 1.0,
+    recent_border: datetime | None = None,
+) -> tuple:
+    """
+    Train a direct fraud CatBoost: red (target=1) vs yellow+green (target=0).
+
+    Unlike the hierarchical pair, this is a single model that directly predicts
+    P(fraud | tx).  CatBoost's native categorical handling (especially for
+    customer_id) provides orthogonal signal to the LGBM ensemble.
+
+    Returns (model, best_iteration, val_pr_auc)
+    """
+    print(f"\nTraining Main CatBoost (direct fraud) …", flush=True)
+
+    train_df = train_df.copy()
+    # target: red=1, yellow+green=0
+    train_df["__main_target"] = (train_df["raw_target"] == 1).astype(np.int8)
+
+    # Weights: red > yellow > green (recent slightly higher than old green)
+    w = np.full(len(train_df), green_old_weight, dtype=np.float32)
+    w[train_df["raw_target"].values == 1] = red_weight
+    w[train_df["raw_target"].values == 0] = yellow_weight    # yellow (labeled non-fraud)
+    if recent_border is not None and "is_recent" in train_df.columns:
+        is_recent_green = (train_df["raw_target"] == -1) & (train_df["is_recent"] == 1)
+        w[is_recent_green.values] = green_recent_weight
+    train_df["__main_weight"] = w
+
+    n_red    = int((train_df["__main_target"] == 1).sum())
+    n_yellow = int((train_df["raw_target"] == 0).sum())
+    n_green  = int((train_df["raw_target"] == -1).sum())
+    print(f"  Main train : {len(train_df):,} rows  "
+          f"({n_red:,} red, {n_yellow:,} yellow, {n_green:,} green)", flush=True)
+
+    avail_feats = [c for c in all_features if c in train_df.columns]
+    cat_idx = [avail_feats.index(c) for c in cat_features if c in avail_feats]
+
+    train_pool = Pool(
+        train_df[avail_feats],
+        label=train_df["__main_target"].values,
+        weight=train_df["__main_weight"].values,
+        cat_features=cat_idx,
+    )
+
+    # Val: labeled rows only, raw_target as binary target
+    val_df = val_labeled_df.copy()
+    avail_val = [c for c in avail_feats if c in val_df.columns]
+    cat_idx_val = [avail_val.index(c) for c in cat_features if c in avail_val]
+    val_pool = Pool(
+        val_df[avail_val],
+        label=val_df["raw_target"].values.astype(np.int8),
+        cat_features=cat_idx_val,
+    )
+
+    _params = {k: v for k, v in params.items() if k not in ("verbose",)}
+    verbose = params.get("verbose", 100)
+    es = _params.pop("od_wait", 300)
+    od_type = _params.pop("od_type", "Iter")
+    _params.update({"od_type": od_type, "od_wait": es})
+
+    t0 = time.perf_counter()
+    model = CatBoostClassifier(**_params)
+    model.fit(train_pool, eval_set=val_pool, use_best_model=True, verbose=verbose)
+
+    best_iter = model.get_best_iteration() or _params.get("iterations", 1000)
+    val_raw   = model.predict(val_pool, prediction_type="RawFormulaVal")
+    val_prauc = average_precision_score(
+        val_df["raw_target"].values.astype(np.int8), val_raw
+    )
+    print(f"\n  Main CatBoost | training time : {_fmt(time.perf_counter() - t0)}")
+    print(f"  Main CatBoost | best_iter     : {best_iter}")
+    print(f"  Main CatBoost | val PR-AUC    : {val_prauc:.6f}\n", flush=True)
+
+    del train_df, val_df, train_pool, val_pool
+    gc.collect()
+    return model, best_iter, val_prauc

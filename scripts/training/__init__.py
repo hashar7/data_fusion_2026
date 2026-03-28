@@ -1,5 +1,5 @@
 from scripts.training.pipeline       import train_baseline
-from scripts.training.pipeline_v2    import train_v2, resume_from_step10b
+from scripts.training.pipeline_v2    import train_v2
 from scripts.training.train          import train_model
 from scripts.training.train_catboost import train_catboost_model
 from scripts.training.evaluate       import evaluate
@@ -15,7 +15,7 @@ from scripts.training.config        import (
 __all__ = [
     "train_baseline",
     "train_v2",
-    "resume_from_step10b",
+    # "resume_from_step10b",  # removed in v2 rewrite
     "train_model",
     "train_catboost_model",
     "evaluate",

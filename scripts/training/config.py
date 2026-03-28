@@ -93,15 +93,13 @@ EARLY_STOPPING_ROUNDS_BY_GROUP = {
     1: 200,
 }
 
-# ── Multi-seed ensemble ────────────────────────────────────────────────────────
-# Each group is trained N times with different random seeds; val scores are
-# averaged before blending.  5 seeds reduces variance at moderate wall-time cost
-# (early stopping keeps individual runs short).
-ENSEMBLE_SEEDS = [42, 7, 13, 17, 99]
+# ── Ensemble seeds ─────────────────────────────────────────────────────────────
+# Single seed per model for speed.  Change to a list of N seeds to enable
+# multi-seed averaging at the cost of N× wall-time.
+ENSEMBLE_SEEDS = [42]
 
-# CatBoost multi-seed: train this many CatBoost seeds per group and average.
-# 3 seeds balances variance reduction against wall-time (CatBoost is slower).
-CATBOOST_SEEDS = [42, 7, 13]
+# CatBoost: single seed per group in train_baseline().
+CATBOOST_SEEDS = [42]
 
 # ── CatBoost parameters ────────────────────────────────────────────────────────
 # Default fallback weight; overridden per-group via grid search at training time.
@@ -266,12 +264,12 @@ SUSPICIOUS_GREEN_RATIO = 0.10
 
 # Boundary between "recent" and "old" green transactions for weight assignment.
 # Recent greens may include unreported fraud — give them slightly less penalty weight.
-RECENT_BORDER = "2025-01-01"
+RECENT_BORDER = "2025-02-01"
 
 # Sample weights for the suspicious model (is_labeled vs green task)
 SUSPICIOUS_LABELED_WEIGHT   = 6.0    # red or yellow row
 SUSPICIOUS_GREEN_RECENT_W   = 1.5    # green, event_dttm >= RECENT_BORDER
-SUSPICIOUS_GREEN_OLD_W      = 1.0    # green, event_dttm < RECENT_BORDER
+SUSPICIOUS_GREEN_OLD_W      = 3.0    # green, event_dttm < RECENT_BORDER — reliably non-fraud
 
 # Sample weights for the Red|Suspicious model (red vs yellow, labeled only)
 RGS_RED_WEIGHT    = 2.5
@@ -343,3 +341,44 @@ LGBM_PARAMS_RECENT = {
     "num_threads": max(1, (__import__("os").cpu_count() or 4) - 1),
 }
 RECENT_MODEL_PATH = "model_recent.txt"
+
+# ── Full-feature hierarchical mode ───────────────────────────────────────────
+# When True, hierarchical CatBoost models use the same full feature set as LGBM
+# (feature_cols) plus customer_id and mcc_code_int as extra categoricals.
+# Falls back to HIERARCHICAL_NUM_FEATURES / HIERARCHICAL_CAT_FEATURES when False.
+HIER_USE_ALL_FEATURES = True
+HIER_FULL_GREEN_RATIO = 0.05   # reduced from 0.10 to fit full features in 32 GB
+
+# ── Main CatBoost model (direct fraud prediction) ────────────────────────────
+# Single global CatBoost trained on all rows:  target = red (1) vs yellow+green (0).
+# Provides orthogonal signal via native categorical handling (esp. customer_id).
+MAIN_CATBOOST_PARAMS = {
+    "iterations":     5000,
+    "learning_rate":  0.05,
+    "depth":          8,
+    "l2_leaf_reg":    8.0,
+    "loss_function":  "Logloss",
+    "eval_metric":    "PRAUC",
+    "task_type":      "CPU",
+    "thread_count":   -1,
+    "random_seed":    42,
+    "od_type":        "Iter",
+    "od_wait":        300,
+    "verbose":        100,
+    "allow_writing_files": False,
+}
+MAIN_RED_WEIGHT     = 10.0
+MAIN_YELLOW_WEIGHT  = 2.5
+MAIN_GREEN_RECENT_W = 1.5
+MAIN_GREEN_OLD_W    = 3.0    # reliably non-fraud — higher weight than recent greens
+MAIN_MODEL_PATH     = "model_main_catboost.cbm"
+
+# ── Blend configuration ──────────────────────────────────────────────────────
+BLEND_IN_LOGIT_SPACE = True   # blend model logits instead of probabilities
+
+# ── All-rows blend optimisation ──────────────────────────────────────────────
+# Optimise blend weights on labeled + sampled unlabeled val rows, treating
+# unlabeled as target=0.  This better matches the competition metric if it
+# evaluates on all test operations (not just labeled ones).
+BLEND_ON_ALL_ROWS = True
+BLEND_UNLABELED_SAMPLE_RATIO = 0.01  # fraction of unlabeled val rows to include
