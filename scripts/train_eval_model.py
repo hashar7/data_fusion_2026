@@ -8,7 +8,8 @@ All logic lives in scripts/training/:
   predict.py  — score_test (submission CSV)
   pipeline.py — train_baseline (orchestrator)
 """
-from scripts.training.pipeline import train_baseline  # noqa: F401 (re-exported)
+from scripts.training.pipeline    import train_baseline  # noqa: F401 (re-exported)
+from scripts.training.pipeline_v2 import train_v2, resume_from_step10b  # noqa: F401
 from scripts.training import (                         # noqa: F401
     train_model, evaluate, score_test,
     load_labels, build_memmaps,

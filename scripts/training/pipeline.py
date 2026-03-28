@@ -19,6 +19,7 @@ from scripts.training.config import (
     CATBOOST_PARAMS, CATBOOST_PARAMS_BY_GROUP, CATBOOST_BLEND_WEIGHT,
     LGBM_MODEL_PATH_FMT, CATBOOST_MODEL_PATH_FMT,
     RETRAIN_FULL_ITER_FACTOR, UNDERSAMPLE_SEED,
+    YELLOW_WEIGHT_MULTIPLIER,
 )
 from scripts.training._utils import _fmt, _parquet_files, _progress
 from scripts.training.data import load_labels, count_rows, build_memmaps, _load_cache
@@ -136,12 +137,12 @@ def train_baseline() -> None:
     # ── Step 1: Build or reload memmap split files ────────────────────────────
     cached = _load_cache(STAGING_DIR)
     if cached is not None:
-        X_train, y_train, X_val, y_val, il_val, tg_train, tg_val, feature_cols = cached
+        X_train, y_train, X_val, y_val, il_val, tg_train, tg_val, il_train, feature_cols = cached
     else:
         labels = load_labels()
         n_train, n_val = count_rows(files, cutoff, train_end)
         (X_train, y_train, X_val, y_val, il_val,
-         tg_train, tg_val, feature_cols) = build_memmaps(
+         tg_train, tg_val, il_train, feature_cols) = build_memmaps(
             files, labels, cutoff, train_end, n_train, n_val, STAGING_DIR
         )
         del labels
@@ -219,6 +220,8 @@ def train_baseline() -> None:
                 lgbm_params=group_lgbm_params,
                 early_stopping_rounds=group_es_rounds,
                 seed_override=seed,
+                il_train=il_train,
+                yellow_weight_multiplier=YELLOW_WEIGHT_MULTIPLIER,
             )
             seed_best_iters.append(booster.best_iteration)
 

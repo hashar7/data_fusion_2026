@@ -26,6 +26,8 @@ def train_model(
     seed_override: int | None = None,
     retrain_extra: tuple[np.ndarray, np.ndarray] | None = None,
     n_rounds_fixed: int | None = None,
+    il_train: np.ndarray | None = None,
+    yellow_weight_multiplier: float = 1.0,
 ) -> lgb.Booster:
     """
     Train a LightGBM binary classifier.
@@ -97,6 +99,20 @@ def train_model(
     X_train_used = np.array(X_train[sample_global])
     y_train_used = y_group[sample_local]
 
+    # Compute yellow mask BEFORE releasing group arrays.
+    # Yellow rows = labeled negatives (y=0 AND il_train=1).  They carry clean signal
+    # and deserve a higher gradient weight than unlabeled green open-loop transactions.
+    yellow_sample_mask = None
+    if il_train is not None and yellow_weight_multiplier > 1.0 and neg_sample_ratio is not None:
+        il_full_np = np.asarray(il_train)
+        if group_global_idx is not None:
+            il_group = il_full_np[group_global_idx]
+        else:
+            il_group = il_full_np
+        il_sampled = il_group[sample_local]
+        yellow_sample_mask = (y_group[sample_local] == 0) & (il_sampled == 1)
+        del il_group, il_sampled, il_full_np
+
     del y_full, y_group, pos_local, neg_local, sample_local, sample_global
     if group_global_idx is not None:
         del group_global_idx
@@ -132,13 +148,20 @@ def train_model(
         print(f"  {k:25s}: {v}")
     print(flush=True)
 
-    # ── Sample weights: correct for undersampling bias ────────────────────────
+    # ── Sample weights: correct for undersampling bias + up-weight yellow rows ─
     # Retained negatives are upweighted to 1/neg_sample_ratio so that the loss
     # gradient landscape matches the true class distribution.  Positives keep
     # weight = 1.  When no undersampling is used all weights are 1.
+    # Yellow rows (labeled negatives with a real 0-label) are explicitly confirmed
+    # non-fraud and carry cleaner signal than unlabeled green rows, so we scale
+    # their weight further by yellow_weight_multiplier.
     if neg_sample_ratio is not None:
         weights = np.ones(len(y_train_used), dtype=np.float32)
         weights[y_train_used == 0] = 1.0 / neg_sample_ratio
+        if yellow_sample_mask is not None and yellow_sample_mask.any():
+            weights[yellow_sample_mask] *= yellow_weight_multiplier
+            print(f"  Yellow rows in sample : {yellow_sample_mask.sum():,} "
+                  f"→ weight × {yellow_weight_multiplier:.1f}", flush=True)
     else:
         weights = None
 

@@ -159,3 +159,187 @@ FEATURE_BLACKLIST = {
 # {seed_idx} = 0-based seed index within ENSEMBLE_SEEDS / CATBOOST_SEEDS
 LGBM_MODEL_PATH_FMT     = "model_{name}_s{seed_idx}.txt"
 CATBOOST_MODEL_PATH_FMT = "model_{name}_catboost_s{seed_idx}.cbm"
+
+# ── Yellow row weighting ────────────────────────────────────────────────────────
+# Labeled negative rows (yellow = explicitly confirmed non-fraud) receive this
+# multiplier on top of the standard 1/neg_sample_ratio weight.  They are rare
+# hard-negatives that define the fraud boundary more clearly than unlabeled greens.
+YELLOW_WEIGHT_MULTIPLIER = 2.0
+
+# ── Hierarchical ensemble (pipeline_v2) ────────────────────────────────────────
+# Two global CatBoost models replace the per-group CatBoost blending:
+#   (1) Suspicious detector  : (red | yellow) vs green  — P(labeled | tx)
+#   (2) Red|Suspicious model : red vs yellow, labeled only — P(fraud | labeled, tx)
+# Final product: sigmoid(susp_raw) × sigmoid(rgs_raw)  ≈ P(fraud | tx)
+#
+# These models use a curated ~50-feature set plus customer_id as a high-cardinality
+# categorical feature (CatBoost handles this natively via ordered target statistics).
+
+# Categorical features for hierarchical CatBoost — int-encoded in the parquet plus
+# customer_id (Int64) and mcc_code_int (derived from mcc_code String at load time).
+HIERARCHICAL_CAT_FEATURES = [
+    "customer_id",                  # 100K unique — CatBoost handles via ordered stats
+    "event_type_nm",
+    "event_desc",
+    "channel_indicator_type",
+    "channel_indicator_sub_type",
+    "currency_iso_cd",
+    "pos_cd",
+    "timezone",
+    "operating_system_type",
+    "phone_voip_call_state",
+    "web_rdp_connection",
+    "tx_type_group",
+    "mcc_code_int",                 # derived: mcc_code (String) cast to Int32
+]
+
+# Numerical features — drawn from top-importance features + label-feedback + risk flags.
+# All are confirmed present from feature_importances.csv / CLAUDE.md.
+HIERARCHICAL_NUM_FEATURES = [
+    # Amount
+    "operaton_amt",
+    "log_amount",
+    "amount_diff_from_prev",
+    "amount_ratio_prev",
+    # Temporal
+    "hour",
+    "day_of_month",
+    "week_of_year",
+    "time_since_last_tx_minutes",
+    "time_since_last_3_tx_mean",
+    "time_gap_mean_30d",
+    "time_gap_variance_30d",
+    "time_gap_cv_30d",
+    "minutes_from_midnight",
+    # Per-customer behavioral
+    "tx_count_lifetime",
+    "event_desc_user_freq",
+    "event_desc_share_user",
+    "event_type_user_freq",
+    "tx_time_zscore_given_user",
+    "circadian_deviation_score",
+    # Per-channel behavioral
+    "spend_in_channel_lifetime",
+    "tx_count_in_channel_lifetime",
+    "channel_usage_share",
+    # Z-scores / anomaly
+    "amount_zscore_channel",
+    "amount_zscore_given_channel",
+    "amount_zscore_mcc",
+    "amount_zscore_given_device",
+    # Session
+    "session_amount_sum",
+    "session_duration_minutes",
+    "session_avg_amount",
+    "session_tx_count",
+    # Rolling
+    "tx_count_90d",
+    "tx_count_30d",
+    "amount_zscore_30d",
+    "amount_mean_90d",
+    "amount_std_90d",
+    "cumulative_spend_90d",
+    # Previous operations (sequence)
+    "prev_1_op_desc",
+    "prev_2_op_desc",
+    "prev_3_op_desc",
+    # Label feedback (Section K — populated when build_processed_dataset called with labels_lf)
+    "fb_cust_prev_red_cnt",
+    "fb_cust_prev_red_rate",
+    "fb_cust_prev_any_red",
+    "fb_sec_since_prev_red",
+    "fb_sec_since_prev_yellow",
+    "fb_cust_prev_labeled_cnt",
+    "fb_desc_prev_red_rate",
+    "fb_desc_prev_red_cnt",
+    # Binary risk flags (Section J)
+    "is_very_high_risk_desc",
+    "is_near_certain_fraud_pair",
+    "is_p2p_danger_channel",
+    "is_high_risk_desc",
+    "is_high_risk_channel",
+]
+
+# Fraction of unlabeled green rows to keep per partition for the suspicious model.
+# 10 % gives ~6M green train rows — sufficient diversity, fits in 32 GB RAM.
+SUSPICIOUS_GREEN_RATIO = 0.10
+
+# Boundary between "recent" and "old" green transactions for weight assignment.
+# Recent greens may include unreported fraud — give them slightly less penalty weight.
+RECENT_BORDER = "2025-01-01"
+
+# Sample weights for the suspicious model (is_labeled vs green task)
+SUSPICIOUS_LABELED_WEIGHT   = 6.0    # red or yellow row
+SUSPICIOUS_GREEN_RECENT_W   = 1.5    # green, event_dttm >= RECENT_BORDER
+SUSPICIOUS_GREEN_OLD_W      = 1.0    # green, event_dttm < RECENT_BORDER
+
+# Sample weights for the Red|Suspicious model (red vs yellow, labeled only)
+RGS_RED_WEIGHT    = 2.5
+RGS_YELLOW_WEIGHT = 1.0
+
+# CatBoost params for the suspicious (P(labeled) detector) model
+SUSPICIOUS_CATBOOST_PARAMS = {
+    "iterations":     3000,
+    "learning_rate":  0.05,
+    "depth":          8,
+    "l2_leaf_reg":    6.0,
+    "loss_function":  "Logloss",
+    "eval_metric":    "AUC",
+    "task_type":      "CPU",
+    "thread_count":   -1,
+    "random_seed":    42,
+    "od_type":        "Iter",
+    "od_wait":        200,
+    "verbose":        100,
+    "allow_writing_files": False,
+}
+
+# CatBoost params for the Red|Suspicious (P(fraud | labeled)) model
+RGS_CATBOOST_PARAMS = {
+    "iterations":     5000,
+    "learning_rate":  0.05,
+    "depth":          8,
+    "l2_leaf_reg":    8.0,
+    "loss_function":  "Logloss",
+    "eval_metric":    "PRAUC",
+    "task_type":      "CPU",
+    "thread_count":   -1,
+    "random_seed":    42,
+    "od_type":        "Iter",
+    "od_wait":        300,
+    "verbose":        100,
+    "allow_writing_files": False,
+}
+
+# Saved model paths for hierarchical models
+SUSPICIOUS_MODEL_PATH = "model_suspicious.cbm"
+RGS_MODEL_PATH        = "model_rgs.cbm"
+
+# ── Recent LightGBM (pipeline_v2) ──────────────────────────────────────────────
+# Optional: train one extra LightGBM on data from RECENT_BORDER onward.
+# Captures temporal drift in fraud patterns closer to the test period.
+TRAIN_RECENT_LGBM        = True
+RECENT_NEG_SAMPLE_RATIO  = 0.05   # negative undersampling for recent dataset
+
+LGBM_PARAMS_RECENT = {
+    **{k: v for k, v in {
+        "objective":         "binary",
+        "metric":            "average_precision",
+        "verbosity":         -1,
+        "device_type":       "cpu",
+        "num_leaves":        127,
+        "max_depth":         -1,
+        "min_child_samples": 200,
+        "learning_rate":     0.02,
+        "n_estimators":      2000,
+        "max_bin":           255,
+        "subsample":         0.8,
+        "subsample_freq":    1,
+        "colsample_bytree":  0.8,
+        "reg_alpha":         0.1,
+        "reg_lambda":        0.1,
+        "seed":              42,
+    }.items()},
+    "num_threads": max(1, (__import__("os").cpu_count() or 4) - 1),
+}
+RECENT_MODEL_PATH = "model_recent.txt"

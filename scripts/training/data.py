@@ -14,6 +14,7 @@ from scripts.training.config import LABELS_PATH
 from scripts.training._utils import _progress, _get_feature_cols
 
 _CACHE_META_FILE = "memmap_meta.json"
+_IL_TRAIN_FILE   = "il_train.npy"
 
 
 def load_labels() -> pl.DataFrame:
@@ -68,9 +69,11 @@ def _load_cache(staging_dir: str):
     tg_train_path = out / "tx_type_group_train.npy"
     tg_val_path   = out / "tx_type_group_val.npy"
 
+    il_train_path = out / _IL_TRAIN_FILE
+
     missing = [p.name for p in [meta_path, X_train_path, y_train_path,
                                  X_val_path, y_val_path, il_val_path,
-                                 tg_train_path, tg_val_path]
+                                 tg_train_path, tg_val_path, il_train_path]
                if not p.exists()]
     if missing:
         print(f"  Cache miss — missing: {missing}", flush=True)
@@ -92,6 +95,8 @@ def _load_cache(staging_dir: str):
     print(f"    Features      : {n_features}  "
           f"({feature_cols[0]} … {feature_cols[-1]})\n", flush=True)
 
+    il_train_path = out / _IL_TRAIN_FILE
+
     X_train_mm  = np.memmap(str(X_train_path),  dtype="float32", mode="r", shape=(n_train, n_features))
     y_train_mm  = np.memmap(str(y_train_path),  dtype="int8",    mode="r", shape=(n_train,))
     X_val_mm    = np.memmap(str(X_val_path),    dtype="float32", mode="r", shape=(n_val, n_features))
@@ -99,8 +104,10 @@ def _load_cache(staging_dir: str):
     il_val_mm   = np.memmap(str(il_val_path),   dtype="int8",    mode="r", shape=(n_val,))
     tg_train_mm = np.memmap(str(tg_train_path), dtype="int8",    mode="r", shape=(n_train,))
     tg_val_mm   = np.memmap(str(tg_val_path),   dtype="int8",    mode="r", shape=(n_val,))
+    il_train_mm = np.memmap(str(il_train_path), dtype="int8",    mode="r", shape=(n_train,))
 
-    return X_train_mm, y_train_mm, X_val_mm, y_val_mm, il_val_mm, tg_train_mm, tg_val_mm, feature_cols
+    return (X_train_mm, y_train_mm, X_val_mm, y_val_mm, il_val_mm,
+            tg_train_mm, tg_val_mm, il_train_mm, feature_cols)
 
 
 def _save_cache_meta(staging_dir: str, n_train: int, n_val: int,
@@ -155,15 +162,17 @@ def build_memmaps(
     il_val_path   = str(out / "is_labeled_val.npy")
     tg_train_path = str(out / "tx_type_group_train.npy")
     tg_val_path   = str(out / "tx_type_group_val.npy")
+    il_train_path = str(out / _IL_TRAIN_FILE)
 
     print("Allocating memmap files …", flush=True)
-    X_train_mm  = np.memmap(X_train_path,  dtype="float32", mode="w+", shape=(n_train, n_features))
-    y_train_mm  = np.memmap(y_train_path,  dtype="int8",    mode="w+", shape=(n_train,))
-    X_val_mm    = np.memmap(X_val_path,    dtype="float32", mode="w+", shape=(n_val, n_features))
-    y_val_mm    = np.memmap(y_val_path,    dtype="int8",    mode="w+", shape=(n_val,))
-    il_val_mm   = np.memmap(il_val_path,   dtype="int8",    mode="w+", shape=(n_val,))
-    tg_train_mm = np.memmap(tg_train_path, dtype="int8",    mode="w+", shape=(n_train,))
-    tg_val_mm   = np.memmap(tg_val_path,   dtype="int8",    mode="w+", shape=(n_val,))
+    X_train_mm   = np.memmap(X_train_path,  dtype="float32", mode="w+", shape=(n_train, n_features))
+    y_train_mm   = np.memmap(y_train_path,  dtype="int8",    mode="w+", shape=(n_train,))
+    X_val_mm     = np.memmap(X_val_path,    dtype="float32", mode="w+", shape=(n_val, n_features))
+    y_val_mm     = np.memmap(y_val_path,    dtype="int8",    mode="w+", shape=(n_val,))
+    il_val_mm    = np.memmap(il_val_path,   dtype="int8",    mode="w+", shape=(n_val,))
+    tg_train_mm  = np.memmap(tg_train_path, dtype="int8",    mode="w+", shape=(n_train,))
+    tg_val_mm    = np.memmap(tg_val_path,   dtype="int8",    mode="w+", shape=(n_val,))
+    il_train_mm  = np.memmap(il_train_path, dtype="int8",    mode="w+", shape=(n_train,))
 
     print(f"  X_train.npy : {n_train:,} × {n_features}  "
           f"≈ {n_train * n_features * 4 / 1e9:.1f} GB on disk")
@@ -200,16 +209,19 @@ def build_memmaps(
         gc.collect()
 
         if len(train_chunk) > 0:
-            X_np  = train_chunk.select(feature_cols).to_numpy(allow_copy=True).astype(np.float32)
-            y_np  = train_chunk["target"].to_numpy().astype(np.int8)
-            tg_np = train_chunk["model_group"].to_numpy().astype(np.int8)
-            n     = len(train_chunk)
-            X_train_mm[train_cursor : train_cursor + n]  = X_np
-            y_train_mm[train_cursor : train_cursor + n]  = y_np
+            X_np   = train_chunk.select(feature_cols).to_numpy(allow_copy=True).astype(np.float32)
+            y_np   = train_chunk["target"].to_numpy().astype(np.int8)
+            tg_np  = train_chunk["model_group"].to_numpy().astype(np.int8)
+            # il_train: 1 if this row is in the labeled set (red or yellow), 0 for open-loop green
+            il_np  = train_chunk["event_id"].is_in(labels_event_ids).cast(pl.Int8).to_numpy().astype(np.int8)
+            n      = len(train_chunk)
+            X_train_mm [train_cursor : train_cursor + n] = X_np
+            y_train_mm [train_cursor : train_cursor + n] = y_np
             tg_train_mm[train_cursor : train_cursor + n] = tg_np
+            il_train_mm[train_cursor : train_cursor + n] = il_np
             train_cursor    += n
             total_pos_train += int(y_np.sum())
-            del X_np, y_np, tg_np
+            del X_np, y_np, tg_np, il_np
         del train_chunk
         gc.collect()
 
@@ -233,13 +245,15 @@ def build_memmaps(
         _progress(i + 1, len(files), wall_times,
                   suffix=f"written train {train_cursor:,} | val {val_cursor:,}")
 
-    X_train_mm.flush();  y_train_mm.flush();  tg_train_mm.flush()
-    X_val_mm.flush();    y_val_mm.flush();    il_val_mm.flush();  tg_val_mm.flush()
-    n_labeled_val = int(il_val_mm[:val_cursor].sum())
+    X_train_mm.flush();  y_train_mm.flush();  tg_train_mm.flush();  il_train_mm.flush()
+    X_val_mm.flush();    y_val_mm.flush();    il_val_mm.flush();    tg_val_mm.flush()
+    n_labeled_val   = int(il_val_mm[:val_cursor].sum())
+    n_labeled_train = int(il_train_mm[:train_cursor].sum())
 
     print(f"\n\n  Train : {train_cursor:,} rows  "
           f"| {total_pos_train:,} positives "
-          f"({total_pos_train / max(train_cursor, 1):.4%})")
+          f"({total_pos_train / max(train_cursor, 1):.4%})"
+          f"  | {n_labeled_train:,} labeled (red+yellow)")
     print(f"  Val   : {val_cursor:,} rows  "
           f"| {total_pos_val:,} positives "
           f"({total_pos_val / max(val_cursor, 1):.4%})\n")
@@ -261,5 +275,7 @@ def build_memmaps(
     il_val_mm   = np.memmap(il_val_path,   dtype="int8",    mode="r", shape=(val_cursor,))
     tg_train_mm = np.memmap(tg_train_path, dtype="int8",    mode="r", shape=(train_cursor,))
     tg_val_mm   = np.memmap(tg_val_path,   dtype="int8",    mode="r", shape=(val_cursor,))
+    il_train_mm = np.memmap(il_train_path, dtype="int8",    mode="r", shape=(train_cursor,))
 
-    return X_train_mm, y_train_mm, X_val_mm, y_val_mm, il_val_mm, tg_train_mm, tg_val_mm, feature_cols
+    return (X_train_mm, y_train_mm, X_val_mm, y_val_mm, il_val_mm,
+            tg_train_mm, tg_val_mm, il_train_mm, feature_cols)
