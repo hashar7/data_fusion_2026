@@ -106,9 +106,24 @@ def add_rolling_features(lf: pl.LazyFrame) -> pl.LazyFrame:
     lf = lf.with_columns([
         (col("amount_clean").cum_sum().over(["customer_id", "channel_indicator_type"]) - col("amount_clean")).fill_null(0).alias("spend_in_channel_lifetime"),
         (col("event_id").cum_count().over(["customer_id", "channel_indicator_type"]) - 1).alias("tx_count_in_channel_lifetime"),
+        (col("amount_clean").cum_sum().over(["customer_id", "channel_type_subtype"]) - col("amount_clean")).fill_null(0).alias("spend_in_channel_type_subtype_lifetime"),
+        (col("event_id").cum_count().over(["customer_id", "channel_type_subtype"]) - 1).alias("tx_count_in_channel_type_subtype_lifetime"),
+        # evtype_channel
+        (col("amount_clean").cum_sum().over(["customer_id", "evtype_channel"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_channel_lifetime"),
+        (col("event_id").cum_count().over(["customer_id", "evtype_channel"]) - 1).alias("tx_count_in_evtype_channel_lifetime"),
+        # evtype_subchannel
+        (col("amount_clean").cum_sum().over(["customer_id", "evtype_subchannel"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_subchannel_lifetime"),
+        (col("event_id").cum_count().over(["customer_id", "evtype_subchannel"]) - 1).alias("tx_count_in_evtype_subchannel_lifetime"),
+        # evtype_mcc (two-column over since mcc_code is String)
+        (col("amount_clean").cum_sum().over(["customer_id", "event_type_nm", "mcc_code"]) - col("amount_clean")).fill_null(0).alias("spend_in_evtype_mcc_lifetime"),
+        (col("event_id").cum_count().over(["customer_id", "event_type_nm", "mcc_code"]) - 1).alias("tx_count_in_evtype_mcc_lifetime"),
     ])
     lf = lf.with_columns([
         (col("tx_count_in_channel_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("channel_usage_share"),
+        (col("tx_count_in_channel_type_subtype_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("channel_type_subtype_usage_share"),
+        (col("tx_count_in_evtype_channel_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("evtype_channel_usage_share"),
+        (col("tx_count_in_evtype_subchannel_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("evtype_subchannel_usage_share"),
+        (col("tx_count_in_evtype_mcc_lifetime") / col("tx_count_lifetime").clip(lower_bound=1)).fill_null(0).alias("evtype_mcc_usage_share"),
     ])
 
     EPS_CARD = 1e-9

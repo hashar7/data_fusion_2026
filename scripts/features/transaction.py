@@ -95,6 +95,23 @@ def add_transaction_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .alias("model_group"),
     ])
 
+    # ── Combined categorical interaction columns ────────────────────────────────
+    # Encode common categorical pairs as single integers so downstream features
+    # can use one-column group-by/over instead of two-column.
+    lf = lf.with_columns([
+        (col("channel_indicator_type") * 1000 + col("channel_indicator_sub_type"))
+        .cast(pl.Int32)
+        .alias("channel_type_subtype"),
+
+        (col("event_type_nm") * 1000 + col("channel_indicator_type"))
+        .cast(pl.Int32)
+        .alias("evtype_channel"),
+
+        (col("event_type_nm") * 1000 + col("channel_indicator_sub_type"))
+        .cast(pl.Int32)
+        .alias("evtype_subchannel"),
+    ])
+
     # Masked amounts for rolling aggregation by transaction type.
     # amount_card / amount_p2p contribute their amount in the relevant window sums;
     # the other type contributes 0, so window sums give per-type spending directly.

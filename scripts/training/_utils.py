@@ -3,7 +3,7 @@ from pathlib import Path
 
 import polars as pl
 
-from scripts.training.config import NON_FEATURE_COLS
+from scripts.training.config import NON_FEATURE_COLS, FEATURE_BLACKLIST
 
 
 # ── Progress display ──────────────────────────────────────────────────────────
@@ -47,5 +47,6 @@ def _get_feature_cols(df: pl.DataFrame) -> list:
         pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
         pl.Float32, pl.Float64,
     }
+    exclude = NON_FEATURE_COLS | FEATURE_BLACKLIST
     return [c for c in df.columns
-            if c not in NON_FEATURE_COLS and df[c].dtype in numeric]
+            if c not in exclude and df[c].dtype in numeric]
