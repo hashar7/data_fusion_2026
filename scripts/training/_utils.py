@@ -1,12 +1,20 @@
 """Shared utility helpers (progress display, file discovery, column selection)."""
 from pathlib import Path
+import os
+import joblib
+import glob
+import re
 
+import numpy as np
 import polars as pl
+import lightgbm as lgb
+from catboost import CatBoostClassifier
 
+from scripts.training.config import CATBOOST_FU_MODEL_FILENAME, RF_MODEL_FILENAME, TX_TYPE_GROUPS, LGBM_MODEL_PATH_FMT
 from scripts.training.config import NON_FEATURE_COLS
 
 
-# ── Progress display ──────────────────────────────────────────────────────────
+# ── Progress display ──────────────────────────────────────────────────────────––––––––––––––
 
 def _bar(done: int, total: int, width: int = 35) -> str:
     filled = int(width * done / max(total, 1))
@@ -35,10 +43,56 @@ def _progress(done: int, total: int, wall_times: list, suffix: str = "") -> None
     )
 
 
-# ── File / column helpers ─────────────────────────────────────────────────────
+# ── File / column helpers ─────────────────────────────────────────────────────––––––––––––––
 
 def _parquet_files(directory: str) -> list:
     return sorted(Path(directory).glob("*.parquet"))
+
+
+def _prepare_models_dir(models_dir: str) -> None:
+    """
+    Create models_dir if it does not exist.
+    If unversioned model files (model_*.txt / model_*.cbm) are already present,
+    rename them all with a _ver_N suffix so the new run's files don't overwrite them.
+    All files from the same previous run share the same version number.
+    """
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Collect unversioned model files — anything that does NOT already have _ver_N
+    all_files = (
+        glob.glob(os.path.join(models_dir, "model_*.txt")) +
+        glob.glob(os.path.join(models_dir, "model_*.cbm")) +
+        glob.glob(os.path.join(models_dir, "model_*.pkl"))
+    )
+    unversioned = [
+        f for f in all_files
+        if not re.search(r"_ver_\d+\.(txt|cbm|pkl)$", f)
+    ]
+
+    if not unversioned:
+        return
+
+    # Find the highest existing version number so we don't collide
+    versioned = (
+        glob.glob(os.path.join(models_dir, "model_*_ver_*.txt")) +
+        glob.glob(os.path.join(models_dir, "model_*_ver_*.cbm")) +
+        glob.glob(os.path.join(models_dir, "model_*_ver_*.pkl"))
+    )
+    max_ver = 0
+    for f in versioned:
+        m = re.search(r"_ver_(\d+)\.(txt|cbm|pkl)$", f)
+        if m:
+            max_ver = max(max_ver, int(m.group(1)))
+
+    next_ver = max_ver + 1
+    print(f"  Found {len(unversioned)} existing model file(s) - "
+          f"archiving as _ver_{next_ver} ...")
+    for f in sorted(unversioned):
+        base, ext = os.path.splitext(f)
+        dest = f"{base}_ver_{next_ver}{ext}"
+        os.rename(f, dest)
+        print(f"    {os.path.basename(f)}  ->  {os.path.basename(dest)}")
+    print()
 
 
 def _get_feature_cols(df: pl.DataFrame) -> list:
@@ -49,3 +103,88 @@ def _get_feature_cols(df: pl.DataFrame) -> list:
     }
     return [c for c in df.columns
             if c not in NON_FEATURE_COLS and df[c].dtype in numeric]
+
+
+def _load_tx_type_catboost_models(models_dir: str) -> dict[int, CatBoostClassifier]:
+    model_files = {
+        0: "model_np_type7_catboost.cbm",
+        1: "model_np_other_catboost.cbm",
+        2: "model_card_catboost.cbm",
+        3: "model_p2p_catboost.cbm",
+    }
+
+    models: dict[int, CatBoostClassifier] = {}
+    for group_id, filename in model_files.items():
+        path = os.path.join(models_dir, filename)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing tx_type_group CatBoost model: {path}")
+        model = CatBoostClassifier()
+        model.load_model(path)
+        models[group_id] = model
+        print(f"Loaded tx_type_group CatBoost model → {path}", flush=True)
+
+    print()
+    return models
+
+
+def _load_tx_type_lgbm_models(models_dir: str) -> dict[int, list[lgb.Booster]]:
+    """
+    Load pre-trained tx_type_group LightGBM models for all available seeds.
+
+    Expected names come from LGBM_MODEL_PATH_FMT, e.g.:
+        model_card_lgbm_seed0.txt
+        model_np_other_lgbm_seed1.txt
+        ...
+    """
+    boosters_by_group: dict[int, list[lgb.Booster]] = {}
+
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        pattern = os.path.join(
+            models_dir,
+            LGBM_MODEL_PATH_FMT.format(name=group_name, seed_idx="*"),
+        )
+        paths = sorted(glob.glob(pattern))
+        if not paths:
+            raise FileNotFoundError(
+                f"No tx_type_group LightGBM models found for group {group_id} "
+                f"({group_name}) using pattern {pattern!r}"
+            )
+
+        boosters: list[lgb.Booster] = []
+        for path in paths:
+            boosters.append(lgb.Booster(model_file=path))
+            print(f"Loaded tx_type_group LightGBM model → {path}", flush=True)
+
+        boosters_by_group[group_id] = boosters
+
+    print()
+    return boosters_by_group
+
+
+def _load_rf_bundle(models_dir: str) -> dict:
+    path = os.path.join(models_dir, RF_MODEL_FILENAME)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing RF model bundle: {path}")
+    bundle = joblib.load(path)
+    print(f"Loaded RF bundle → {path}", flush=True)
+    return bundle
+
+
+def _load_fu_catboost_model(models_dir: str) -> CatBoostClassifier:
+    path = os.path.join(models_dir, CATBOOST_FU_MODEL_FILENAME)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing F/U CatBoost model: {path}")
+    model = CatBoostClassifier()
+    model.load_model(path)
+    print(f"Loaded F/U CatBoost model → {path}", flush=True)
+    return model
+
+
+# ── System helpers ─────────────────────────────────────────────────────–––––––––––––––––––––
+
+def _estimate_matrix_ram_gb(n_rows: int, n_features: int, dtype_bytes: int = 4) -> float:
+    """
+    Estimate dense matrix RAM usage in GB.
+    """
+    return (n_rows * n_features * dtype_bytes) / (1024 ** 3)
+

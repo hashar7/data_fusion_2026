@@ -1,8 +1,8 @@
-from scripts.training.pipeline       import train_baseline, train_rf_fg, train_catboost_fu
+from scripts.training.pipeline       import train_baseline, train_rf_fg, train_catboost_fu, train_final_ensemble
 from scripts.training.train          import train_model
 from scripts.training.train_catboost import train_catboost_model
 from scripts.training.evaluate       import evaluate
-from scripts.training.predict        import score_test
+from scripts.training.predict        import score_test, score_test_final_ensemble
 from scripts.training.data           import load_labels, build_memmaps
 from scripts.training.train_rf       import build_labeled_train_indices, tune_rf_hyperparameters, train_rf_model, sanitize_rf_features
 from scripts.training.config         import (

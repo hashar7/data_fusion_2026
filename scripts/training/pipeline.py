@@ -1,17 +1,22 @@
 """Top-level orchestrator: trains one ensemble per tx_type_group."""
 import gc
-import glob
 import os
-import re
 import time
 from datetime import datetime
 import joblib
 
 import numpy as np
 import polars as pl
+
 from sklearn.metrics import average_precision_score
 
+from scripts.training._utils import (
+    _fmt, _parquet_files, _progress, _estimate_matrix_ram_gb, _prepare_models_dir
+)
+
+
 # ── tx_type_group based models ────────────────────────────────────────────────––––
+import lightgbm as lgb
 from scripts.training.config import (
     FEATURES_DIR, STAGING_DIR, SUBMISSION_PATH, MODELS_DIR,
     VAL_CUTOFF_DATE, TRAIN_END_DATE, TX_TYPE_GROUPS,
@@ -20,10 +25,8 @@ from scripts.training.config import (
     EARLY_STOPPING_ROUNDS_BY_GROUP,
     ENSEMBLE_SEEDS,
     CATBOOST_PARAMS, CATBOOST_PARAMS_BY_GROUP, CATBOOST_BLEND_WEIGHT,
-    LGBM_MODEL_PATH_FMT, CATBOOST_MODEL_PATH_FMT,
-    CATBOOST_FU_MODEL_FILENAME, UNDERSAMPLE_SEED,
+    LGBM_MODEL_PATH_FMT, CATBOOST_MODEL_PATH_FMT, UNDERSAMPLE_SEED,
 )
-from scripts.training._utils import _fmt, _parquet_files, _progress
 from scripts.training.data import load_labels, count_rows, build_memmaps, _load_cache
 from scripts.training.train import train_model
 from scripts.training.train_catboost import train_catboost_model
@@ -41,51 +44,37 @@ from scripts.training.config import (
     RF_MODEL_FILENAME,
 )
 
+# ── F vs U catboost ────────────────────────────────────────────────–––––––––––––
+from scripts.training.config import (
+    CATBOOST_FU_MODEL_FILENAME,
+)
 
-def _prepare_models_dir(models_dir: str) -> None:
-    """
-    Create models_dir if it does not exist.
-    If unversioned model files (model_*.txt / model_*.cbm) are already present,
-    rename them all with a _ver_N suffix so the new run's files don't overwrite them.
-    All files from the same previous run share the same version number.
-    """
-    os.makedirs(models_dir, exist_ok=True)
+# ── Final ensemble ────────────────────────────────────────────────–––––––––––––
+from catboost import CatBoostClassifier
+import lightgbm as lgb
+from scripts.training.data import (
+    _load_cache,
+    build_memmaps,
+    count_rows,
+    load_labels,
+)
+from scripts.training.train_catboost import train_catboost_model
+from scripts.training.train_rf import sanitize_rf_features
+from scripts.training._utils import _load_tx_type_catboost_models, _load_rf_bundle, _load_fu_catboost_model, _load_tx_type_lgbm_models
+from scripts.training.predict import score_test_final_ensemble, _score_tx_group_ensemble_chunk
+from scripts.training.config import (
+    VAL_CUTOFF_DATE, TRAIN_END_DATE,
 
-    # Collect unversioned model files — anything that does NOT already have _ver_N
-    all_files = (
-        glob.glob(os.path.join(models_dir, "model_*.txt")) +
-        glob.glob(os.path.join(models_dir, "model_*.cbm")) +
-        glob.glob(os.path.join(models_dir, "model_*.pkl"))
-    )
-    unversioned = [
-        f for f in all_files
-        if not re.search(r"_ver_\d+\.(txt|cbm|pkl)$", f)
-    ]
+    MODELS_DIR, FEATURES_DIR, STAGING_DIR, 
+    CATBOOST_FU_MODEL_FILENAME, RF_MODEL_FILENAME,
+    FINAL_ENSEMBLE_MODEL_FILENAME, 
+    SUBMISSION_PATH, 
+    LGBM_MODEL_PATH_FMT,
 
-    if not unversioned:
-        return
-
-    # Find the highest existing version number so we don't collide
-    versioned = (
-        glob.glob(os.path.join(models_dir, "model_*_ver_*.txt")) +
-        glob.glob(os.path.join(models_dir, "model_*_ver_*.cbm")) +
-        glob.glob(os.path.join(models_dir, "model_*_ver_*.pkl"))
-    )
-    max_ver = 0
-    for f in versioned:
-        m = re.search(r"_ver_(\d+)\.(txt|cbm|pkl)$", f)
-        if m:
-            max_ver = max(max_ver, int(m.group(1)))
-
-    next_ver = max_ver + 1
-    print(f"  Found {len(unversioned)} existing model file(s) - "
-          f"archiving as _ver_{next_ver} ...")
-    for f in sorted(unversioned):
-        base, ext = os.path.splitext(f)
-        dest = f"{base}_ver_{next_ver}{ext}"
-        os.rename(f, dest)
-        print(f"    {os.path.basename(f)}  ->  {os.path.basename(dest)}")
-    print()
+    TX_TYPE_GROUPS, 
+    CATBOOST_PARAMS, CATBOOST_BLEND_WEIGHT,
+    NEG_SAMPLE_RATIO,
+)
 
 
 def _score_val_group(
@@ -120,13 +109,6 @@ def _score_val_group(
         _progress(chunk_i + 1, n_chunks, chunk_times, suffix=suffix)
     print()
     return scores
-
-
-def _estimate_matrix_ram_gb(n_rows: int, n_features: int, dtype_bytes: int = 4) -> float:
-    """
-    Estimate dense matrix RAM usage in GB.
-    """
-    return (n_rows * n_features * dtype_bytes) / (1024 ** 3)
 
 
 def _build_fu_train_mask(
@@ -197,6 +179,85 @@ def _build_fu_train_mask(
     train_fu_mask = np.concatenate(mask_parts).astype(bool, copy=False)
     print(f"  Train F/U mask built: {len(train_fu_mask):,} rows\n", flush=True)
     return train_fu_mask
+
+
+def _score_meta_features_chunked(
+    X_mm: np.ndarray,
+    global_indices: np.ndarray,
+    model_groups: np.ndarray,
+    tx_lgbm_models: dict[int, list[lgb.Booster]],
+    tx_cb_models: dict[int, CatBoostClassifier],
+    rf_bundle: dict,
+    fu_cb_model: CatBoostClassifier,
+    chunk_size: int = 250_000,
+    suffix: str = "meta scoring",
+) -> np.ndarray:
+    """
+    Build meta-features from previously trained models.
+
+    Meta-feature order:
+        0 -> tx_type_group LightGBM average score
+        1 -> tx_type_group CatBoost score
+        2 -> tx_type_group blended ensemble score
+        3 -> RF F/G score
+        4 -> CatBoost F/U score
+    """
+    rf_model = rf_bundle["model"]
+    rf_feature_cols = rf_bundle["feature_cols"]
+
+    n = len(global_indices)
+    X_meta = np.empty((n, 5), dtype=np.float32)
+
+    n_chunks = max(1, (n + chunk_size - 1) // chunk_size)
+    chunk_times: list[float] = []
+
+    for chunk_i, cs in enumerate(range(0, n, chunk_size)):
+        t0 = time.perf_counter()
+        ce = min(cs + chunk_size, n)
+
+        idx = global_indices[cs:ce]
+        X_c = np.asarray(X_mm[idx], dtype=np.float32)
+        mg_c = np.asarray(model_groups[idx], dtype=np.int8)
+
+        tx_lgbm_scores, tx_cb_scores, tx_blend_scores = _score_tx_group_ensemble_chunk(
+            X_c,
+            mg_c,
+            tx_lgbm_models,
+            tx_cb_models,
+            blend_weight=CATBOOST_BLEND_WEIGHT,
+        )
+
+        X_rf = sanitize_rf_features(
+            X_c,
+            feature_cols=rf_feature_cols,
+            stage=f"{suffix} rf chunk {chunk_i}",
+        )
+        rf_scores = rf_model.predict_proba(X_rf)[:, 1].astype(np.float32)
+        fu_scores = fu_cb_model.predict_proba(X_c)[:, 1].astype(np.float32)
+
+        X_meta[cs:ce, 0] = tx_lgbm_scores
+        X_meta[cs:ce, 1] = tx_cb_scores
+        X_meta[cs:ce, 2] = tx_blend_scores
+        X_meta[cs:ce, 3] = rf_scores
+        X_meta[cs:ce, 4] = fu_scores
+
+        del (
+            X_c,
+            X_rf,
+            mg_c,
+            tx_lgbm_scores,
+            tx_cb_scores,
+            tx_blend_scores,
+            rf_scores,
+            fu_scores,
+        )
+        gc.collect()
+
+        chunk_times.append(time.perf_counter() - t0)
+        _progress(chunk_i + 1, n_chunks, chunk_times, suffix=suffix)
+
+    print()
+    return X_meta
 
 
 def train_baseline() -> None:
@@ -881,6 +942,250 @@ def train_catboost_fu() -> None:
         y_train_np,
         y_val_np,
         il_val_np,
+    )
+    gc.collect()
+
+    print("─" * 65)
+    print(f"Total wall time           : {_fmt(time.perf_counter() - total_start)}")
+    print(f"Validation PR-AUC         : {val_pr_auc:.6f}")
+    print(f"Final validation PR-AUC   : {final_val_pr_auc:.6f}")
+    print("─" * 65)
+
+
+def train_final_ensemble() -> None:
+    """
+    Train final CatBoost ensemble on outputs of previous models:
+
+        1. tx_type_group LightGBM score
+        2. tx_type_group CatBoost score
+        3. tx_type_group blended score (same as train_baseline)
+        4. RF score trained on F vs G
+        5. CatBoost score trained on F vs U
+
+    Final ensemble target:
+        1 = F
+        0 = G + U
+
+    Negative subsampling:
+        n_neg_keep = min(n_neg, int(n_neg * NEG_SAMPLE_RATIO))
+        n_neg_keep = max(n_neg_keep, n_pos)
+        n_neg_keep = min(n_neg_keep, n_neg)
+    """
+    total_start = time.perf_counter()
+    cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
+    train_end = datetime.fromisoformat(TRAIN_END_DATE)
+
+    # _prepare_models_dir(MODELS_DIR)
+
+    files = _parquet_files(FEATURES_DIR)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {FEATURES_DIR!r}")
+    print(f"Found {len(files)} parquet partitions in {FEATURES_DIR!r}\n", flush=True)
+
+    cached = _load_cache(STAGING_DIR)
+    if cached is not None:
+        X_train, y_train, X_val, y_val, il_val, tg_train, tg_val, feature_cols = cached
+    else:
+        labels = load_labels()
+        n_train, n_val = count_rows(files, cutoff, train_end)
+        (
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            il_val,
+            tg_train,
+            tg_val,
+            feature_cols,
+        ) = build_memmaps(
+            files, labels, cutoff, train_end, n_train, n_val, STAGING_DIR
+        )
+        del labels
+        gc.collect()
+
+    print(f"  Feature columns : {len(feature_cols)}")
+    print(f"  X_train shape   : {X_train.shape}")
+    print(f"  X_val shape     : {X_val.shape}\n")
+
+    y_train_np = np.asarray(y_train)
+    y_val_np = np.asarray(y_val)
+    tg_train_np = np.asarray(tg_train)
+    tg_val_np = np.asarray(tg_val)
+
+    train_idx = np.arange(len(y_train_np), dtype=np.int64)
+    val_idx = np.arange(len(y_val_np), dtype=np.int64)
+
+    n_train_pos = int(y_train_np.sum())
+    n_train_neg = len(y_train_np) - n_train_pos
+    n_val_pos = int(y_val_np.sum())
+    n_val_neg = len(y_val_np) - n_val_pos
+
+    print("Final ensemble full-data summary:")
+    print(
+        f"  Train rows : {len(y_train_np):,}  |  "
+        f"F positives: {n_train_pos:,}  |  non-fraud negatives (G+U): {n_train_neg:,}"
+    )
+    print(
+        f"  Val rows   : {len(y_val_np):,}  |  "
+        f"F positives: {n_val_pos:,}  |  non-fraud negatives (G+U): {n_val_neg:,}\n"
+    )
+
+    neg_ratio = NEG_SAMPLE_RATIO
+    n_neg_keep_est = min(n_train_neg, int(n_train_neg * neg_ratio))
+    n_neg_keep_est = max(n_neg_keep_est, n_train_pos)
+
+    n_rows_fit_est = n_train_pos + n_neg_keep_est
+    est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, 5, dtype_bytes=4)
+
+    print("Final ensemble train matrix RAM estimate after negative subsampling:")
+    print(f"  NEG_SAMPLE_RATIO candidate : {neg_ratio}")
+    print(f"  Positives kept             : {n_train_pos:,}")
+    print(f"  Negatives kept             : {n_neg_keep_est:,}")
+    print(f"  Final train rows           : {n_rows_fit_est:,}")
+    print(f"  Estimated X RAM            : {est_ram_gb:.6f} GB\n")
+
+    tx_lgbm_models = _load_tx_type_lgbm_models(MODELS_DIR)
+    tx_cb_models = _load_tx_type_catboost_models(MODELS_DIR)
+    rf_bundle = _load_rf_bundle(MODELS_DIR)
+    fu_cb_model = _load_fu_catboost_model(MODELS_DIR)
+
+    print("=" * 65)
+    print("  Building train meta-features")
+    print("=" * 65)
+    print()
+
+    X_meta_train = _score_meta_features_chunked(
+        X_train,
+        train_idx,
+        tg_train_np,
+        tx_lgbm_models,
+        tx_cb_models,
+        rf_bundle,
+        fu_cb_model,
+        suffix="meta train",
+    )
+    y_meta_train = y_train_np.astype(np.int8, copy=False)
+
+    print("=" * 65)
+    print("  Building validation meta-features")
+    print("=" * 65)
+    print()
+
+    X_meta_val = _score_meta_features_chunked(
+        X_val,
+        val_idx,
+        tg_val_np,
+        tx_lgbm_models,
+        tx_cb_models,
+        rf_bundle,
+        fu_cb_model,
+        suffix="meta val",
+    )
+    y_meta_val = y_val_np.astype(np.int8, copy=False)
+    il_meta_val = np.ones(len(y_meta_val), dtype=np.int8)
+
+    print("Meta-feature matrices:")
+    print(f"  X_meta_train shape : {X_meta_train.shape}")
+    print(f"  X_meta_val shape   : {X_meta_val.shape}\n")
+
+    meta_feature_cols = [
+        "score_tx_group_lgbm",
+        "score_tx_group_catboost",
+        "score_tx_group_blend",
+        "score_rf_fg",
+        "score_catboost_fu",
+    ]
+
+    print("=" * 65)
+    print("  Final ensemble CatBoost - train split")
+    print("=" * 65)
+    print()
+
+    final_model = train_catboost_model(
+        X_meta_train,
+        y_meta_train,
+        X_meta_val,
+        y_meta_val,
+        il_meta_val,
+        meta_feature_cols,
+        train_row_mask=None,
+        neg_sample_ratio=neg_ratio,
+        catboost_params=CATBOOST_PARAMS,
+    )
+
+    model_path = os.path.join(MODELS_DIR, FINAL_ENSEMBLE_MODEL_FILENAME)
+    final_model.save_model(model_path)
+    print(f"\nFinal ensemble model saved → {model_path}\n", flush=True)
+
+    val_scores = final_model.predict_proba(X_meta_val)[:, 1].astype(np.float32)
+    val_pr_auc = average_precision_score(y_meta_val, val_scores)
+    print(f"Validation PR-AUC [final ensemble]: {val_pr_auc:.6f}\n", flush=True)
+
+    print("=" * 65)
+    print("  Final ensemble CatBoost - train + val combined")
+    print("=" * 65)
+    print()
+
+    X_meta_full = np.concatenate([X_meta_train, X_meta_val], axis=0)
+    y_meta_full = np.concatenate([y_meta_train, y_meta_val], axis=0)
+
+    n_pos_full = int(y_meta_full.sum())
+    n_neg_full = len(y_meta_full) - n_pos_full
+    n_neg_keep_full = min(n_neg_full, int(n_neg_full * neg_ratio))
+    n_neg_keep_full = max(n_neg_keep_full, n_pos_full)
+    n_neg_keep_full = min(n_neg_keep_full, n_neg_full)
+
+    print("Combined refit subset before internal subsampling:")
+    print(f"  Positives total           : {n_pos_full:,}")
+    print(f"  Negatives total           : {n_neg_full:,}")
+    print(f"  Target negatives after ratio : {n_neg_keep_full:,}")
+    print(f"  Total rows available      : {len(y_meta_full):,}\n")
+
+    final_model_refit = train_catboost_model(
+        X_meta_full,
+        y_meta_full,
+        X_meta_val,
+        y_meta_val,
+        il_meta_val,
+        meta_feature_cols,
+        train_row_mask=None,
+        neg_sample_ratio=neg_ratio,
+        catboost_params=CATBOOST_PARAMS,
+    )
+
+    final_model_refit.save_model(model_path)
+    print(f"\nRefit final ensemble model saved → {model_path}\n", flush=True)
+
+    final_val_scores = final_model_refit.predict_proba(X_meta_val)[:, 1].astype(np.float32)
+    final_val_pr_auc = average_precision_score(y_meta_val, final_val_scores)
+    print(f"Final validation PR-AUC [final ensemble]: {final_val_pr_auc:.6f}\n", flush=True)
+
+    score_test_final_ensemble(
+        final_model_refit,
+        tx_lgbm_models,
+        tx_cb_models,
+        rf_bundle,
+        fu_cb_model,
+        feature_cols,
+        SUBMISSION_PATH,
+    )
+
+    del (
+        y_train_np,
+        y_val_np,
+        tg_train_np,
+        tg_val_np,
+        train_idx,
+        val_idx,
+        X_meta_train,
+        y_meta_train,
+        X_meta_val,
+        y_meta_val,
+        il_meta_val,
+        val_scores,
+        X_meta_full,
+        y_meta_full,
+        final_val_scores,
     )
     gc.collect()
 

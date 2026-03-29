@@ -128,7 +128,6 @@ CALIBRATOR_PATH_FMT     = "calibrator_{name}.pkl"
 
 
 # ── F vs G random forrest config ────────────────────────────────────────────────
-
 RF_N_JOBS = -1
 RF_CV_N_SPLITS = 8
 RF_CV_SEED = 42
@@ -153,5 +152,9 @@ RF_PARAM_GRID = {
 
 
 # ── F vs U catboost model ────────────────────────────────────────────────––––––
-
 CATBOOST_FU_MODEL_FILENAME = "model_catboost_fu.cbm"
+
+
+# ── Final ensemble ────────────────────────────────────────────────–––––––––––––
+FINAL_ENSEMBLE_MODEL_FILENAME = "model_final_ensemble_catboost.cbm"
+
