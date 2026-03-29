@@ -9,7 +9,7 @@ LABELS_PATH     = "../../data/raw/train_labels.parquet"
 FEATURES_DIR    = "../data_processed"   # ALL periods in one directory
 STAGING_DIR     = "../data_splits"
 SUBMISSION_PATH = "submission.csv"
-MODELS_DIR      = "models"             # all model files saved here; created on first run
+MODELS_DIR      = "models/v2_2"             # all model files saved here; created on first run
 
 # Per-group model output paths (keyed by model_group value).
 # model_group refines tx_type_group: nonpayment is split into two sub-models
@@ -129,32 +129,31 @@ CALIBRATOR_PATH_FMT     = "calibrator_{name}.pkl"
 
 # ── F vs G random forrest config ────────────────────────────────────────────────
 RF_N_JOBS = -1
-RF_CV_N_SPLITS = 8
 RF_CV_SEED = 42
-RF_MODEL_FILENAME = "model_rf_fg.pkl"
 
-# Fixed RF settings
+RF_MODEL_PATH_FMT = "model_{name}_rf_fg.pkl"
+
 RF_BASE_PARAMS = {
+    "n_estimators": 1500,
+    "max_depth": 20,
+    "min_samples_split": 50,
+    "min_samples_leaf": 20,
+    "max_features": "sqrt",
     "bootstrap": True,
     "class_weight": "balanced_subsample",
     "random_state": RF_CV_SEED,
-    "n_jobs": RF_N_JOBS
-}
-
-# Hyperparameter plane for 6-fold CV
-RF_PARAM_GRID = {
-    "n_estimators": [1500],
-    "max_depth": [20],
-    "min_samples_split": [20],
-    "min_samples_leaf": [1],
-    "max_features": ['sqrt'],
+    "n_jobs": RF_N_JOBS,
 }
 
 
 # ── F vs U catboost model ────────────────────────────────────────────────––––––
-CATBOOST_FU_MODEL_FILENAME = "model_catboost_fu.cbm"
+CATBOOST_FU_MODEL_PATH_FMT = "model_{name}_catboost_fu.cbm"
 
 
 # ── Final ensemble ────────────────────────────────────────────────–––––––––––––
 FINAL_ENSEMBLE_MODEL_FILENAME = "model_final_ensemble_catboost.cbm"
 
+
+# ── tmp paths ────────────────────────────────────────────────–––––––––––––
+RF_MODEL_FILENAME = '.'
+CATBOOST_FU_MODEL_FILENAME = "model_catboost_fu.cbm"

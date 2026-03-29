@@ -34,15 +34,14 @@ from scripts.training.evaluate import evaluate
 from scripts.training.predict import score_test
 
 # ── F vs G Random Forrest ────────────────────────────────────────────────–––––––––
+import joblib
+
 from scripts.training.train_rf import (
-    build_labeled_train_indices,
-    tune_rf_hyperparameters,
-    train_rf_model,
+    build_labeled_fg_train_mapping,
     sanitize_rf_features,
+    train_rf_model,
 )
-from scripts.training.config import (
-    RF_MODEL_FILENAME,
-)
+from scripts.training.config import RF_MODEL_PATH_FMT, RF_BASE_PARAMS
 
 # ── F vs U catboost ────────────────────────────────────────────────–––––––––––––
 from scripts.training.config import (
@@ -483,22 +482,15 @@ def train_baseline() -> None:
     print("─" * 65)
 
 
-def train_rf_fg() -> None:
+def train_rf_fg_by_group() -> None:
     """
-    Train RandomForest on labeled F/G rows only.
+    Train one RandomForest skeptic model per model_group on labeled F/G rows only.
 
-    Reuses existing memmaps:
-        X_train, y_train, X_val, y_val, is_labeled_val, memmap_meta
+    Target is reversed relative to fraud:
+        1 = G  (complex non-fraud)
+        0 = F  (fraud)
 
-    Steps:
-        1. Reload or build memmaps
-        2. Reconstruct labeled-train row indices by rescanning processed parquet partitions
-        3. Load only labeled train/val rows into RAM
-        4. Tune RF with 6-fold CV on labeled-train rows
-        5. Fit best RF on labeled-train rows and evaluate on labeled val rows
-        6. Refit RF on labeled train + labeled val rows
-        7. Report optimistic PR-AUC on val after refit
-        8. Save final model bundle to MODELS_DIR
+    Uses fixed RF params from config, without CV.
     """
     total_start = time.perf_counter()
     cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
@@ -518,8 +510,14 @@ def train_rf_fg() -> None:
         labels = load_labels()
         n_train, n_val = count_rows(files, cutoff, train_end)
         (
-            X_train, y_train, X_val, y_val, il_val,
-            tg_train, tg_val, feature_cols
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            il_val,
+            tg_train,
+            tg_val,
+            feature_cols,
         ) = build_memmaps(
             files, labels, cutoff, train_end, n_train, n_val, STAGING_DIR
         )
@@ -530,123 +528,157 @@ def train_rf_fg() -> None:
     print(f"  X_train shape   : {X_train.shape}")
     print(f"  X_val shape     : {X_val.shape}\n")
 
-    # We need original labels again to identify F/G rows inside train.
     labels = load_labels()
 
-    # ── Build train labeled mapping (F/G only) ──────────────────────────────
-    train_labeled_idx = build_labeled_train_indices(files, labels, cutoff)
+    train_labeled_idx, train_orig_target = build_labeled_fg_train_mapping(files, labels, cutoff)
+
     if len(train_labeled_idx) == 0:
-        raise RuntimeError("No labeled train rows found for RF training.")
+        raise RuntimeError("No labeled F/G train rows found.")
 
-    # ── Val labeled mapping already exists in cache as il_val ───────────────
+    tg_train_np = np.asarray(tg_train)
+    tg_val_np = np.asarray(tg_val)
+    y_val_np = np.asarray(y_val)
     il_val_np = np.asarray(il_val)
+
+    # Reverse target for RF skeptic model:
+    #   original target: 1 = F, 0 = G
+    #   RF target      : 1 = G, 0 = F
+    y_train_rf_all = (train_orig_target == 0).astype(np.int8)
+
+    # On val memmap, labeled rows are already F/G only.
     val_labeled_idx = np.flatnonzero(il_val_np == 1)
+    y_val_rf_all = (y_val_np[val_labeled_idx] == 0).astype(np.int8)
+    tg_val_labeled = tg_val_np[val_labeled_idx]
 
-    if len(val_labeled_idx) == 0:
-        raise RuntimeError("No labeled val rows found for RF validation.")
+    group_pr_aucs: dict[int, float] = {}
 
-    print("Loading labeled train/val subsets into RAM …", flush=True)
+    print("Fixed RF params:")
+    print(f"  {RF_BASE_PARAMS}\n")
 
-    X_train_fg = np.asarray(X_train[train_labeled_idx], dtype=np.float32)
-    y_train_fg = np.asarray(y_train[train_labeled_idx], dtype=np.int8)
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        sep = "=" * 65
+        print(f"\n{sep}")
+        print(f"  RF skeptic model — Group {group_id} — {group_name.upper()}")
+        print(f"{sep}\n")
 
-    X_val_fg = np.asarray(X_val[val_labeled_idx], dtype=np.float32)
-    y_val_fg = np.asarray(y_val[val_labeled_idx], dtype=np.int8)
+        train_group_mask = tg_train_np[train_labeled_idx] == group_id
+        val_group_mask = tg_val_labeled == group_id
 
-    X_train_fg = sanitize_rf_features(
-        X_train_fg,
-        feature_cols=feature_cols,
-        stage="X_train_fg",
-    )
-    X_val_fg = sanitize_rf_features(
-        X_val_fg,
-        feature_cols=feature_cols,
-        stage="X_val_fg",
-    )
+        train_idx_g = train_labeled_idx[train_group_mask]
+        y_train_g = y_train_rf_all[train_group_mask]
 
-    print(f"  Train labeled rows : {len(y_train_fg):,}")
-    print(f"    positives (F)    : {int(y_train_fg.sum()):,}")
-    print(f"    negatives (G)    : {int((y_train_fg == 0).sum()):,}")
-    print(f"  Val labeled rows   : {len(y_val_fg):,}")
-    print(f"    positives (F)    : {int(y_val_fg.sum()):,}")
-    print(f"    negatives (G)    : {int((y_val_fg == 0).sum()):,}\n")
+        val_idx_g = val_labeled_idx[val_group_mask]
+        y_val_g = y_val_rf_all[val_group_mask]
 
-    # ── CV tuning on train only ─────────────────────────────────────────────
-    best_params, cv_results = tune_rf_hyperparameters(
-        X_train_fg,
-        y_train_fg,
-    )
+        n_train_g = len(train_idx_g)
+        n_val_g = len(val_idx_g)
+        n_train_pos_g = int(y_train_g.sum()) if n_train_g > 0 else 0
+        n_train_neg_g = n_train_g - n_train_pos_g
+        n_val_pos_g = int(y_val_g.sum()) if n_val_g > 0 else 0
+        n_val_neg_g = n_val_g - n_val_pos_g
 
-    # ── Best model on train only → true holdout val metric ──────────────────
-    print("Training best RF on labeled train rows …", flush=True)
-    best_train_model = train_rf_model(
-        X_train_fg,
-        y_train_fg,
-        rf_params=best_params,
-    )
+        print(f"  Train labeled rows : {n_train_g:,}  |  G positives: {n_train_pos_g:,}  |  F negatives: {n_train_neg_g:,}")
+        print(f"  Val labeled rows   : {n_val_g:,}  |  G positives: {n_val_pos_g:,}  |  F negatives: {n_val_neg_g:,}\n")
 
-    val_scores = best_train_model.predict_proba(X_val_fg)[:, 1].astype(np.float32)
-    val_pr_auc = average_precision_score(y_val_fg, val_scores)
+        if n_train_g == 0 or n_val_g == 0:
+            print("  SKIP: no train/val data for this group.\n")
+            continue
+        if n_train_pos_g == 0 or n_train_neg_g == 0:
+            print("  SKIP: train subset has only one class.\n")
+            continue
+        if n_val_pos_g == 0 or n_val_neg_g == 0:
+            print("  SKIP: val subset has only one class.\n")
+            continue
 
-    print(f"\nHoldout val PR-AUC (best RF trained on train only): {val_pr_auc:.6f}\n", flush=True)
+        print("Loading group train/val subsets into RAM …", flush=True)
 
-    # ── Refit on train + val labeled rows ───────────────────────────────────
-    print("Refitting RF on labeled train + labeled val rows …", flush=True)
-    X_full_fg = np.concatenate([X_train_fg, X_val_fg], axis=0)
-    y_full_fg = np.concatenate([y_train_fg, y_val_fg], axis=0)
+        X_train_g = np.asarray(X_train[train_idx_g], dtype=np.float32)
+        X_val_g = np.asarray(X_val[val_idx_g], dtype=np.float32)
 
-    X_full_fg = sanitize_rf_features(
-        X_full_fg,
-        feature_cols=feature_cols,
-        stage="X_full_fg",
-    )
+        X_train_g = sanitize_rf_features(
+            X_train_g,
+            feature_cols=feature_cols,
+            stage=f"X_train_rf_group_{group_id}",
+        )
+        X_val_g = sanitize_rf_features(
+            X_val_g,
+            feature_cols=feature_cols,
+            stage=f"X_val_rf_group_{group_id}",
+        )
 
-    final_model = train_rf_model(
-        X_full_fg,
-        y_full_fg,
-        rf_params=best_params,
-    )
+        print(f"  X_train_g shape : {X_train_g.shape}")
+        print(f"  X_val_g shape   : {X_val_g.shape}\n")
 
-    final_val_scores = final_model.predict_proba(X_val_fg)[:, 1].astype(np.float32)
-    final_val_pr_auc = average_precision_score(y_val_fg, final_val_scores)
+        print("Training RF with fixed params …", flush=True)
+        best_train_model = train_rf_model(
+            X_train_g,
+            y_train_g,
+            rf_params=RF_BASE_PARAMS,
+        )
 
-    print(
-        f"PR-AUC after refit on train+val: {final_val_pr_auc:.6f}",
-        flush=True,
-    )
-    # ── Save final model bundle ──────────────────────────────────────────────
-    model_path = os.path.join(MODELS_DIR, RF_MODEL_FILENAME)
-    bundle = {
-        "model": final_model,
-        "feature_cols": feature_cols,
-        "best_params": best_params,
-        "cv_results": cv_results,
-        "holdout_val_pr_auc": float(val_pr_auc),
-        "optimistic_val_pr_auc_after_refit": float(final_val_pr_auc),
-    }
-    joblib.dump(bundle, model_path)
-    print(f"Final RF model bundle saved → {model_path}\n", flush=True)
+        val_scores = best_train_model.predict_proba(X_val_g)[:, 1].astype(np.float32)
+        val_pr_auc = average_precision_score(y_val_g, val_scores)
+        group_pr_aucs[group_id] = val_pr_auc
 
-    del (
-        labels,
-        train_labeled_idx,
-        val_labeled_idx,
-        X_train_fg,
-        y_train_fg,
-        X_val_fg,
-        y_val_fg,
-        X_full_fg,
-        y_full_fg,
-        val_scores,
-        final_val_scores,
-    )
-    gc.collect()
+        print(f"\nValidation PR-AUC [{group_name} RF skeptic]: {val_pr_auc:.6f}\n", flush=True)
 
-    print(f"{'─' * 65}")
+        print("Refitting RF on train + val labeled rows …", flush=True)
+        X_full_g = np.concatenate([X_train_g, X_val_g], axis=0)
+        y_full_g = np.concatenate([y_train_g, y_val_g], axis=0)
+
+        final_model = train_rf_model(
+            X_full_g,
+            y_full_g,
+            rf_params=RF_BASE_PARAMS,
+        )
+
+        final_val_scores = final_model.predict_proba(X_val_g)[:, 1].astype(np.float32)
+        final_val_pr_auc = average_precision_score(y_val_g, final_val_scores)
+
+        model_path = os.path.join(
+            MODELS_DIR,
+            RF_MODEL_PATH_FMT.format(name=group_name),
+        )
+        bundle = {
+            "model": final_model,
+            "feature_cols": feature_cols,
+            "rf_params": RF_BASE_PARAMS.copy(),
+            "group_id": group_id,
+            "group_name": group_name,
+            "holdout_val_pr_auc": float(val_pr_auc),
+            "final_val_pr_auc_after_refit": float(final_val_pr_auc),
+            "target_definition": {
+                "1": "G_complex_non_fraud",
+                "0": "F_fraud",
+            },
+        }
+        joblib.dump(bundle, model_path)
+        print(f"Final RF skeptic model bundle saved → {model_path}\n", flush=True)
+
+        del (
+            X_train_g,
+            X_val_g,
+            y_train_g,
+            y_val_g,
+            best_train_model,
+            val_scores,
+            X_full_g,
+            y_full_g,
+            final_model,
+            final_val_scores,
+        )
+        gc.collect()
+
+    print(f"\n{'=' * 65}")
+    print("  RF skeptic validation summary")
+    print(f"{'=' * 65}\n")
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        if group_id in group_pr_aucs:
+            print(f"  {group_name:12s} RF PR-AUC : {group_pr_aucs[group_id]:.6f}")
+
+    print(f"\n{'─' * 65}")
     print(f"Total wall time : {_fmt(time.perf_counter() - total_start)}")
-    print(f"Holdout val AP  : {val_pr_auc:.6f}")
-    print(f"Refit val AP    : {final_val_pr_auc:.6f}")
-    print(f"{'─' * 65}")
+    print("─" * 65)
 
 
 def train_catboost_fu() -> None:

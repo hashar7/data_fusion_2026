@@ -10,8 +10,6 @@ from sklearn.model_selection import ParameterGrid, StratifiedKFold
 
 from scripts.training.config import (
     RF_BASE_PARAMS,
-    RF_PARAM_GRID,
-    RF_CV_N_SPLITS,
     RF_CV_SEED,
 )
 from scripts.training._utils import _progress
@@ -23,40 +21,10 @@ def sanitize_rf_features(
     stage: str = "X",
 ) -> np.ndarray:
     """
-    Prepare feature matrix for sklearn RandomForest:
-    - cast to float32
-    - replace +inf / -inf with NaN
-    - replace NaN with 0.0
-
-    Returns a new float32 array safe for sklearn tree models.
+    Prepare feature matrix for sklearn RandomForest.
     """
     X = np.asarray(X, dtype=np.float32)
-
-    inf_mask = ~np.isfinite(X)
-    n_bad = int(inf_mask.sum())
-
-    if n_bad > 0:
-        print(f"  Sanitizing {stage}: found {n_bad:,} non-finite values", flush=True)
-
-        if feature_cols is not None:
-            bad_cols = np.flatnonzero(np.any(inf_mask, axis=0))
-            if len(bad_cols) > 0:
-                preview = [feature_cols[i] for i in bad_cols[:20]]
-                print(
-                    f"    Columns with non-finite values (first {len(preview)}): {preview}",
-                    flush=True,
-                )
-                if len(bad_cols) > 20:
-                    print(f"    ... and {len(bad_cols) - 20} more columns", flush=True)
-
-        X = X.copy()
-        X[~np.isfinite(X)] = np.nan
-
-    nan_count = int(np.isnan(X).sum())
-    if nan_count > 0:
-        print(f"  Filling {nan_count:,} NaN values in {stage} with 0.0", flush=True)
-        X = np.nan_to_num(X, nan=-1.0, posinf=-2.0, neginf=-3.0)
-
+    X = np.nan_to_num(X, nan=-1.0, posinf=-2.0, neginf=-3.0)
     return X
 
 
@@ -135,118 +103,99 @@ def build_labeled_train_indices(
     return labeled_train_idx
 
 
-def tune_rf_hyperparameters(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    param_grid: dict | None = None,
-    n_splits: int = RF_CV_N_SPLITS,
-    cv_seed: int = RF_CV_SEED,
-) -> tuple[dict, list[dict]]:
+def build_labeled_fg_train_mapping(
+    files: list[str],
+    labels: pl.DataFrame,
+    cutoff: datetime,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    6-fold CV hyperparameter search for RandomForest on labeled train rows only.
+    Reconstruct global row indices of labeled train rows inside X_train memmap,
+    together with their original labels from train_labels.parquet.
 
     Returns
     -------
-    best_params : dict
-        Full best parameter dict ready for RandomForestClassifier(**best_params)
-    cv_results : list[dict]
-        Sorted CV results, best first.
+    train_idx : np.ndarray[int64]
+        Global memmap row indices for labeled train rows (F or G only).
+    orig_target : np.ndarray[int8]
+        Original labels from train_labels.parquet:
+            1 = F
+            0 = G
     """
-    if param_grid is None:
-        param_grid = RF_PARAM_GRID
+    print("Building labeled F/G train mapping from processed parquet partitions …", flush=True)
 
-    grid = list(ParameterGrid(param_grid))
-    if not grid:
-        raise RuntimeError("RF_PARAM_GRID is empty.")
+    labels_small = labels.select(["customer_id", "event_id", "target"])
+    train_cursor = 0
+    idx_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    wall_times: list[float] = []
 
-    print(f"RandomForest CV tuning …", flush=True)
-    print(f"  Parameter sets : {len(grid)}")
-    print(f"  CV folds       : {n_splits}")
-    print(f"  Train rows     : {len(y_train):,}")
-    print(f"  Positives      : {int(y_train.sum()):,}")
-    print(f"  Negatives      : {int((y_train == 0).sum()):,}\n")
+    for i, f in enumerate(files):
+        t0 = time.perf_counter()
 
-    cv = StratifiedKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=cv_seed,
-    )
+        chunk = pl.read_parquet(
+            f,
+            columns=["customer_id", "event_id", "event_dttm", "is_train"],
+        )
 
-    results: list[dict] = []
-
-    for param_i, candidate in enumerate(grid, start=1):
-        fold_scores: list[float] = []
-        print(f"  Param set {param_i}/{len(grid)}: {candidate}", flush=True)
-
-        for fold_i, (tr_idx, va_idx) in enumerate(cv.split(X_train, y_train), start=1):
-            params = {
-                **RF_BASE_PARAMS,
-                **candidate,
-                "random_state": cv_seed + fold_i,
-            }
-
-            model = RandomForestClassifier(**params)
-            model.fit(X_train[tr_idx], y_train[tr_idx])
-
-            val_pred = model.predict_proba(X_train[va_idx])[:, 1].astype(np.float32)
-            fold_ap = average_precision_score(y_train[va_idx], val_pred)
-            fold_scores.append(float(fold_ap))
-
-            print(
-                f"    fold {fold_i}/{n_splits}  PR-AUC: {fold_ap:.6f}",
-                flush=True,
+        if chunk["event_dttm"].dtype == pl.Utf8:
+            chunk = chunk.with_columns(
+                pl.col("event_dttm").str.strptime(pl.Datetime, strict=False)
             )
 
-            del model, val_pred
-            gc.collect()
-
-        mean_ap = float(np.mean(fold_scores))
-        std_ap = float(np.std(fold_scores))
-
-        print(
-            f"    mean PR-AUC: {mean_ap:.6f}  |  std: {std_ap:.6f}\n",
-            flush=True,
+        chunk = chunk.join(
+            labels_small,
+            on=["customer_id", "event_id"],
+            how="left",
         )
 
-        results.append(
-            {
-                "candidate_params": candidate,
-                "full_params": {
-                    **RF_BASE_PARAMS,
-                    **candidate,
-                    "random_state": cv_seed,
-                },
-                "fold_scores": fold_scores,
-                "mean_pr_auc": mean_ap,
-                "std_pr_auc": std_ap,
-            }
+        train_chunk = chunk.filter(
+            (pl.col("is_train") == 1) & (pl.col("event_dttm") < cutoff)
         )
 
-    results.sort(key=lambda x: x["mean_pr_auc"], reverse=True)
+        labeled_mask = train_chunk["target"].is_not_null().to_numpy()
+        n_train_chunk = len(train_chunk)
 
-    print("Top CV results:", flush=True)
-    for rank, row in enumerate(results[:10], start=1):
-        print(
-            f"  {rank:>2}. PR-AUC={row['mean_pr_auc']:.6f} ± {row['std_pr_auc']:.6f}  "
-            f"{row['candidate_params']}",
-            flush=True,
+        if labeled_mask.any():
+            idx_parts.append(train_cursor + np.flatnonzero(labeled_mask))
+            y_parts.append(
+                train_chunk["target"].filter(pl.Series(labeled_mask)).to_numpy().astype(np.int8)
+            )
+
+        train_cursor += n_train_chunk
+
+        del chunk, train_chunk, labeled_mask
+        gc.collect()
+
+        wall_times.append(time.perf_counter() - t0)
+        _progress(
+            i + 1,
+            len(files),
+            wall_times,
+            suffix=f"mapped labeled train rows {sum(len(x) for x in idx_parts):,}",
         )
+
     print()
 
-    best_params = results[0]["full_params"]
-    print(f"Best RF params: {best_params}\n", flush=True)
+    if not idx_parts:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int8)
 
-    return best_params, results
+    train_idx = np.concatenate(idx_parts).astype(np.int64, copy=False)
+    orig_target = np.concatenate(y_parts).astype(np.int8, copy=False)
+
+    print(f"  Labeled train rows mapped: {len(train_idx):,}\n", flush=True)
+    return train_idx, orig_target
 
 
 def train_rf_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    rf_params: dict,
+    rf_params: dict | None = None,
 ) -> RandomForestClassifier:
     """
-    Fit one RandomForestClassifier with supplied params.
+    Train one RandomForestClassifier with fixed params.
     """
-    model = RandomForestClassifier(**rf_params)
+    params = RF_BASE_PARAMS.copy() if rf_params is None else rf_params.copy()
+    model = RandomForestClassifier(**params)
     model.fit(X_train, y_train)
     return model
+
