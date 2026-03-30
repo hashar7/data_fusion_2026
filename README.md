@@ -1,88 +1,88 @@
 # Data Fusion 2026 — Guardian Track
 
-Solution to the [Data Fusion 2026](https://ods.ai/competitions/data-fusion2026-guardian) hackathon, Guardian track.
+Решение хакатона [Data Fusion 2026](https://ods.ai/competitions/data-fusion2026-guardian), трек Guardian.
 
-**Task:** classify unconfirmed bank transactions as fraud or legitimate.
-**Metric:** PR-AUC (`sklearn.metrics.average_precision_score`).
-
----
-
-## Problem Description
-
-Bank clients sometimes do not confirm transactions for security reasons. The goal is to build a binary classifier that, for each such "unconfirmed" transaction, predicts whether it is fraudulent.
-
-Key challenges:
-- **Extreme class imbalance** — fraud transactions are very sparse
-- **Temporal realism** — the model must simulate a live classifier; features may only use information available *before* the current transaction
-- **Scale** — 200M+ operations across 100K clients spanning 1.5 years
-- **Three label classes** — red (fraud), yellow (confirmed non-fraud), green (unlabeled open-loop)
-
-### Data Periods
-
-| Period | Dates | Role |
-|--------|-------|------|
-| Pre-train | 2023-10-01 – 2024-09-30 | Unlabeled transaction history for feature context |
-| Train | 2024-10-01 – 2025-05-31 | Labeled data (red/yellow/green) |
-| Pre-test | 2025-06-01 – 2025-08-09 | Unlabeled context preceding test day |
-| Test | 2025-06-01 – 2025-08-09 | One final day per client — must be scored |
+**Задача:** классификация неподтверждённых банковских транзакций как мошеннических или легитимных.
+**Метрика:** PR-AUC (`sklearn.metrics.average_precision_score`).
 
 ---
 
-## Repository Structure
+## Описание задачи
+
+Клиенты банка иногда не подтверждают транзакции по соображениям безопасности. Задача — построить бинарный классификатор, который для каждой такой «неподтверждённой» операции предсказывает, является ли она мошеннической.
+
+Ключевые сложности:
+- **Сильный дисбаланс классов** — мошеннические транзакции встречаются очень редко
+- **Временной реализм** — модель должна работать как живой классификатор; признаки могут использовать только информацию, доступную *до* текущей транзакции
+- **Масштаб** — более 200 млн операций по 100К клиентам за 1.5 года
+- **Три класса меток** — red (мошенничество), yellow (подтверждённая легитимная операция), green (непомеченные транзакции)
+
+### Периоды данных
+
+| Период | Даты | Назначение |
+|--------|------|------------|
+| Pre-train | 2023-10-01 – 2024-09-30 | Непомеченная история транзакций для контекста признаков |
+| Train | 2024-10-01 – 2025-05-31 | Размеченные данные (red/yellow/green) |
+| Pre-test | 2025-06-01 – 2025-08-09 | Непомеченный контекст, предшествующий тестовому дню |
+| Test | 2025-06-01 – 2025-08-09 | Один финальный день на клиента — требует скоринга |
+
+---
+
+## Структура репозитория
 
 ```
 scripts/
-  features/           Feature engineering modules (one file per section A–K)
-    _helpers.py       Shared expression builders
-    global_stats.py   Population-level stats + Bayesian target encodings
-    transaction.py    Section A — datetime, amount flags, tx_type_group, interaction cols
-    behavioral.py     Section B — cumulative per-customer history, lags, log-counts
-    feedback.py       Section K — dynamic label feedback features
-    rolling.py        Section D — rolling window aggregations (9 windows × 14 metrics)
-    device.py         Section E — device/session risk flags
-    temporal.py       Section F — global frequency lookups, circadian deviation
-    zscore.py         Section G — channel/MCC z-scores, composite flags
-    category_stats.py Sections H + I — per-category cumulative stats + target encodings
-    category_risk.py  Section J — hardcoded binary risk flags
-  feature_engineering.py   Public API — runs A → B → K → D → E → F → G → H → I → J
-  feature_calculation.py   Public API — partitioned parquet output pipeline
+  features/           Модули feature engineering (один файл на секцию A–K)
+    _helpers.py       Общие строители выражений
+    global_stats.py   Статистики по популяции + Байесовские target-энкодинги
+    transaction.py    Секция A — дата/время, флаги суммы, tx_type_group, комбинированные колонки
+    behavioral.py     Секция B — накопительная история клиента, лаги, log-счётчики
+    feedback.py       Секция K — динамические признаки на основе истории меток
+    rolling.py        Секция D — rolling-агрегации (9 окон × 14 метрик)
+    device.py         Секция E — флаги риска устройства/сессии
+    temporal.py       Секция F — глобальные частоты, циркадное отклонение
+    zscore.py         Секция G — z-score по каналу/MCC, составные флаги
+    category_stats.py Секции H + I — накопительная статистика по категориям + target-энкодинги
+    category_risk.py  Секция J — жёстко заданные бинарные флаги риска
+  feature_engineering.py   Публичный API — запускает A → B → K → D → E → F → G → H → I → J
+  feature_calculation.py   Публичный API — партиционированный пайплайн вывода в parquet
 
-  calculation/        Partitioned feature calculation
+  calculation/        Партиционированное вычисление признаков
     config.py         OUTPUT_DIR, N_PARTITIONS, ID_COLS
     partition.py      process_partition(), _downcast()
-    pipeline.py       build_processed_dataset() orchestration loop
+    pipeline.py       Оркестрация build_processed_dataset()
 
-  training/           Model training
-    config.py         All tuneable constants (dates, params, seeds, paths)
-    _utils.py         Progress display helpers
-    data.py           load_labels(), build_memmaps(), memmap cache
-    train.py          train_model() — LightGBM with negative undersampling
+  training/           Обучение моделей
+    config.py         Все настраиваемые константы (даты, параметры, seeds, пути)
+    _utils.py         Вспомогательные утилиты прогресс-бара
+    data.py           load_labels(), build_memmaps(), кэш memmap
+    train.py          train_model() — LightGBM с negative undersampling
     train_catboost.py train_catboost_model()
-    hierarchical.py   Hierarchical CatBoost helpers (train_v2 only)
-    evaluate.py       evaluate() — PR-AUC, max-F1, feature importance
-    predict.py        score_test() — submission CSV generation
-    pipeline.py       train_baseline() orchestrator
-    pipeline_v2.py    train_v2() orchestrator (recommended)
-  train_eval_model.py Public API shim — re-exports train_baseline and train_v2
+    hierarchical.py   Вспомогательные функции иерархического CatBoost (только train_v2)
+    evaluate.py       evaluate() — PR-AUC, порог max-F1, важность признаков
+    predict.py        score_test() — генерация submission CSV
+    pipeline.py       Оркестратор train_baseline()
+    pipeline_v2.py    Оркестратор train_v2() (рекомендуется)
+  train_eval_model.py Тонкий публичный API — реэкспортирует train_baseline и train_v2
 
 notebooks/
-  feature_example.ipynb   Main experiment notebook (canonical usage example)
-  models/                 Saved model files
+  feature_example.ipynb   Основной экспериментальный ноутбук (канонический пример использования)
+  models/                 Сохранённые файлы моделей
 
 misc/
-  features.md         Complete feature catalogue (~450 features, organized by section)
+  features.md         Полный каталог признаков (~450 признаков, организован по секциям)
 
-data/                 Raw competition parquets (not in repo)
-data_processed/       Processed feature parquets (output of build_processed_dataset)
-data_splits/          Memmap files + memmap_meta.json (output of build_memmaps)
+data/                 Исходные parquet-файлы соревнования (не в репозитории)
+data_processed/       Обработанные parquet с признаками (выход build_processed_dataset)
+data_splits/          Memmap-файлы + memmap_meta.json (выход build_memmaps)
 ```
 
 ---
 
-## Quick Start
+## Быстрый старт
 
 ```python
-# In the notebook (working directory = notebooks/):
+# В ноутбуке (рабочая директория = notebooks/):
 import sys; sys.path.insert(0, "..")
 
 import polars as pl
@@ -90,7 +90,7 @@ from scripts.feature_engineering import generate_fraud_features, compute_global_
 from scripts.feature_calculation import build_processed_dataset
 from scripts.train_eval_model import train_v2
 
-# 1. Compute global stats + target encodings from train+pretrain
+# 1. Вычислить глобальные статистики + target-энкодинги по train+pretrain
 pretrain_lf = pl.scan_parquet("../../data/pretrain_part_*.parquet")
 train_lf    = pl.scan_parquet("../../data/train_part_*.parquet")
 labels_lf   = pl.scan_parquet("../../data/train_labels.parquet")
@@ -98,7 +98,7 @@ full_lf     = pl.concat([pretrain_lf, train_lf])
 
 global_stats = compute_global_stats(full_lf, labels_lf=labels_lf)
 
-# 2. Build processed feature parquets
+# 2. Построить обработанные parquet с признаками
 all_lf = pl.concat([
     pretrain_lf, train_lf,
     pl.scan_parquet("../../data/pretest.parquet"),
@@ -106,261 +106,261 @@ all_lf = pl.concat([
 ])
 build_processed_dataset(all_lf, global_stats=global_stats, labels_lf=labels_lf)
 
-# 3. Train hierarchical ensemble + generate submission
+# 3. Обучить иерархический ансамбль + сгенерировать submission
 train_v2()
 ```
 
-After step 3, `notebooks/submission.csv` contains the scored test transactions.
+После шага 3 файл `notebooks/submission.csv` содержит скоры для тестовых транзакций.
 
-> **After any feature engineering change:** delete `../data_splits/memmap_meta.json`
-> (and the `.npy` files) to force a memmap rebuild.
+> **После любого изменения feature engineering:** удалить `../data_splits/memmap_meta.json`
+> (и `.npy`-файлы), чтобы принудительно пересобрать memmap.
 
 ---
 
 ## Feature Engineering
 
-The pipeline produces ~450 features across 10 sections, all strictly leakage-free:
-- Rolling windows use `closed="left"` — interval `[t − period, t)` excludes the current row
-- Cumulative features use `cum_count() - 1` / `cum_sum() - current_value`
-- Global statistics (target encodings, population means) are frozen on training data only
+Пайплайн производит ~450 признаков в 10 секциях, все строго защищены от утечки данных:
+- Rolling-окна используют `closed="left"` — интервал `[t − period, t)` не включает текущую строку
+- Накопительные признаки используют `cum_count() - 1` / `cum_sum() - current_value`
+- Глобальные статистики (target-энкодинги, популяционные средние) заморожены только по тренировочным данным
 
-**Full feature catalogue:** [`misc/features.md`](misc/features.md)
+**Полный каталог признаков:** [`misc/features.md`](misc/features.md)
 
-### Pipeline execution order
+### Порядок выполнения пайплайна
 
 ```
-A  transaction.py   — datetime decomposition, amount flags, tx_type_group, interaction cols
-B  behavioral.py    — cumulative counts, lags (n=1..5), running-max, log-frequency
-K  feedback.py      — dynamic label feedback (fraud/non-fraud history per customer)
-D  rolling.py       — 9 windows × 14 metrics + card/P2P splits + derived ratios
-E  device.py        — device risk flags, session features, screen dimensions
-F  temporal.py      — global freq lookups, circadian deviation, velocity flags
-G  zscore.py        — channel/MCC z-scores, combination freq, composite flags
-H  category_stats.py— per-(customer,category) cumulative stats for 8 key dimensions
-I  category_stats.py— Bayesian-smoothed target encodings (12 fraud rates)
-J  category_risk.py — hardcoded binary risk flags from empirical fraud-rate analysis
+A  transaction.py   — разложение даты/времени, флаги суммы, tx_type_group, комбинированные колонки
+B  behavioral.py    — накопительные счётчики, лаги (n=1..5), running-max, log-частоты
+K  feedback.py      — динамическая обратная связь по меткам (история мошенничества клиента)
+D  rolling.py       — 9 окон × 14 метрик + card/P2P сплиты + производные соотношения
+E  device.py        — флаги риска устройства, признаки сессии, размеры экрана
+F  temporal.py      — глобальные частоты, циркадное отклонение, флаги скорости транзакций
+G  zscore.py        — z-score по каналу/MCC, частота комбинаций, составные флаги
+H  category_stats.py— накопительная статистика по (клиент, категория) для 8 ключевых измерений
+I  category_stats.py— Байесовские сглаженные target-энкодинги (12 показателей частоты мошенничества)
+J  category_risk.py — жёстко заданные бинарные флаги риска из эмпирического анализа
 ```
 
-### Key design choices
+### Ключевые архитектурные решения
 
-| Choice | Reason |
-|--------|--------|
-| `tx_type_group` (0/1/2) splits non-payment / card / P2P | Fraud rate and signal differ dramatically across types |
-| `model_group` (0/1/2/3) further splits non-payment by `event_type_nm==7` | type-7 has 70M rows at 58% fraud and overwhelms other types in a single model |
-| Interaction columns `channel_type_subtype`, `evtype_channel`, `evtype_subchannel` | Encode Cartesian combinations as single integers; used in rolling stats, log-counts, and category stats |
-| Section K feedback features | Propagate prior label signal forward in time; `fb_cust_prev_any_red` and `fb_sec_since_prev_red` are among the strongest features |
-| Bayesian target encodings (α=20) | Smooth fraud rates for low-frequency categories; unseen test values filled with global fraud rate |
+| Решение | Обоснование |
+|---------|-------------|
+| `tx_type_group` (0/1/2) делит non-payment / card / P2P | Частота мошенничества и полезные сигналы кардинально различаются между типами |
+| `model_group` (0/1/2/3) дополнительно делит non-payment по `event_type_nm==7` | Тип 7 содержит 70M строк при 58% мошенничества и подавляет остальные типы в единой модели |
+| Комбинированные колонки `channel_type_subtype`, `evtype_channel`, `evtype_subchannel` | Кодируют декартовы произведения как целые числа; используются в rolling-статистике, log-счётчиках и статистиках по категориям |
+| Признаки обратной связи секции K | Переносят сигнал из предыдущих меток вперёд во времени; `fb_cust_prev_any_red` и `fb_sec_since_prev_red` — одни из сильнейших признаков |
+| Байесовские target-энкодинги (α=20) | Сглаживают частоты мошенничества для редких категорий; для новых значений в тесте подставляется глобальная частота |
 
 ---
 
-## Training Pipelines
+## Пайплайны обучения
 
-Two complete pipelines are available. **`train_v2()` is recommended** — it consistently outperforms `train_baseline()` on PR-AUC.
+Доступны два полноценных пайплайна. **Рекомендуется `train_v2()`** — он стабильно превосходит `train_baseline()` по PR-AUC.
 
-### Common infrastructure
+### Общая инфраструктура
 
-Both pipelines share the same memmap build step:
+Оба пайплайна используют один и тот же шаг построения memmap:
 
 ```
 build_memmaps()
-    ├── Scans processed parquets, filters is_train==1
-    ├── Rows with event_dttm < VAL_CUTOFF_DATE (2025-04-01)   → X_train / y_train
-    ├── Rows with VAL_CUTOFF_DATE ≤ event_dttm < TRAIN_END_DATE (2025-06-01) → X_val / y_val
-    ├── il_train.npy  — marks labeled (red+yellow)=1 vs green=0 in train split
-    ├── il_val.npy    — marks labeled rows in val split
-    └── tg_train.npy / tg_val.npy  — model_group routing key per row
+    ├── Сканирует обработанные parquet, фильтрует is_train==1
+    ├── Строки с event_dttm < VAL_CUTOFF_DATE (2025-04-01)                     → X_train / y_train
+    ├── Строки с VAL_CUTOFF_DATE ≤ event_dttm < TRAIN_END_DATE (2025-06-01)    → X_val / y_val
+    ├── il_train.npy  — помечает labeled (red+yellow)=1 vs green=0 в train-сплите
+    ├── il_val.npy    — помечает labeled строки в val-сплите
+    └── tg_train.npy / tg_val.npy  — ключ маршрутизации model_group на строку
 ```
 
-The result is cached in `../data_splits/memmap_meta.json`. Delete it to force a rebuild.
+Результат кэшируется в `../data_splits/memmap_meta.json`. Удалить для принудительной пересборки.
 
-**Label classes in training:**
+**Классы меток при обучении:**
 
-| Class | `target` | Present in `train_labels.parquet` | `il_train` flag |
-|-------|----------|----------------------------------|-----------------|
-| Red (fraud) | 1 | Yes | 1 |
-| Yellow (confirmed non-fraud) | 0 | Yes | 1 |
-| Green (unlabeled open-loop) | 0 | No | 0 |
+| Класс | `target` | Есть в `train_labels.parquet` | Флаг `il_train` |
+|-------|----------|-------------------------------|-----------------|
+| Red (мошенничество) | 1 | Да | 1 |
+| Yellow (подтверждённая легитимная) | 0 | Да | 1 |
+| Green (непомеченные) | 0 | Нет | 0 |
 
-Yellow rows receive `YELLOW_WEIGHT_MULTIPLIER = 2.0` extra gradient weight on top of the standard undersampling correction weight, because they are rare hard-negatives that sharply define the fraud boundary.
+Yellow-строки получают дополнительный вес `YELLOW_WEIGHT_MULTIPLIER = 2.0` поверх стандартного веса коррекции undersampling, поскольку это редкие «сложные негативы», которые чётко очерчивают границу мошенничества.
 
 ---
 
-### `train_baseline()` — Per-group LightGBM + CatBoost ensemble
+### `train_baseline()` — Ансамбль LightGBM + CatBoost по группам
 
 ```
 scripts/training/pipeline.py
 ```
 
-For each of the 4 model groups (`np_type7`, `np_other`, `card`, `p2p`):
+Для каждой из 4 групп моделей (`np_type7`, `np_other`, `card`, `p2p`):
 
-**Step 1 — Multi-seed LightGBM**
-- Trains `len(ENSEMBLE_SEEDS)` = 1 LightGBM model (configurable; set to `[42]` for speed)
-- Negative undersampling at `NEG_SAMPLE_RATIO_BY_GROUP` (default 5% for all groups)
-- Yellow rows get `YELLOW_WEIGHT_MULTIPLIER` extra weight
-- Early stopping on labeled val rows (`PRAUC` metric, 150 rounds patience; 200 for `np_other`)
-- Per-group parameter overrides via `LGBM_PARAMS_BY_GROUP`:
-  - `np_type7`: faster LR (0.01) and fewer estimators (3000) — large homogeneous population
-  - `np_other`: finer splits (`min_child_samples=50`, `num_leaves=63`) — small heterogeneous group
-  - `p2p`: more estimators (8000) — still improving at default iteration cap
+**Шаг 1 — Multi-seed LightGBM**
+- Обучает `len(ENSEMBLE_SEEDS)` = 1 модель LightGBM (настраивается; `[42]` для скорости)
+- Negative undersampling с коэффициентом `NEG_SAMPLE_RATIO_BY_GROUP` (по умолчанию 5% для всех групп)
+- Yellow-строки получают дополнительный вес `YELLOW_WEIGHT_MULTIPLIER`
+- Early stopping на labeled val-строках (метрика `PRAUC`, 150 раундов; 200 для `np_other`)
+- Переопределения параметров по группам через `LGBM_PARAMS_BY_GROUP`:
+  - `np_type7`: более высокий LR (0.01) и меньше деревьев (3000) — большая однородная популяция
+  - `np_other`: более тонкие разбиения (`min_child_samples=50`, `num_leaves=63`) — маленькая неоднородная группа
+  - `p2p`: больше деревьев (8000) — при стандартном лимите итераций ещё улучшается
 
-**Step 2 — Multi-seed CatBoost**
-- Trains `len(CATBOOST_SEEDS)` = 1 CatBoost model per group
-- Same undersampling, `eval_metric=PRAUC`, 100 rounds patience
+**Шаг 2 — Multi-seed CatBoost**
+- Обучает `len(CATBOOST_SEEDS)` = 1 модель CatBoost на группу
+- Те же undersampling, `eval_metric=PRAUC`, терпение 100 раундов
 
-**Step 3 — Per-group blend weight search**
-- Grid searches `w ∈ {0.00, 0.05, …, 0.50}` on labeled val rows
-- Final score = `lgbm_avg × (1 − w) + catboost_avg × w`
-- `CATBOOST_BLEND_WEIGHT = 0.25` is the fallback default only
+**Шаг 3 — Поиск весов смешивания по группам**
+- Перебор `w ∈ {0.00, 0.05, …, 0.50}` на labeled val-строках
+- Итоговый скор = `lgbm_avg × (1 − w) + catboost_avg × w`
+- `CATBOOST_BLEND_WEIGHT = 0.25` — только резервное значение по умолчанию
 
-**Step 4 — Evaluation**
-- PR-AUC per group on labeled val rows
-- Combined PR-AUC across all groups (competition metric proxy)
-- Top-30 feature importances printed for seed-0 of each group
+**Шаг 4 — Оценка качества**
+- PR-AUC по каждой группе на labeled val-строках
+- Суммарный PR-AUC по всем группам (прокси метрики соревнования)
+- Топ-30 важностей признаков выводится для seed-0 каждой группы
 
-**Step 5 — Full-data retraining**
-- All models retrained on `train + labeled_val` combined
-- Rounds = `best_iteration × RETRAIN_FULL_ITER_FACTOR (1.05)`, no early stopping
-- Val negatives are undersampled at the same ratio before appending to avoid class imbalance shift
+**Шаг 5 — Дообучение на полных данных**
+- Все модели переобучаются на `train + labeled_val` вместе
+- Количество раундов = `best_iteration × RETRAIN_FULL_ITER_FACTOR (1.05)`, без early stopping
+- Val-негативы подвергаются undersampling с той же долей перед добавлением, чтобы не нарушить баланс классов
 
-**Step 6 — Test scoring**
-- `score_test()` routes each test row by `model_group`, blends per-group LGBM + CatBoost
-- Writes `submission.csv`
+**Шаг 6 — Скоринг теста**
+- `score_test()` маршрутизирует каждую тестовую строку по `model_group`, смешивает LGBM + CatBoost по группам
+- Записывает `submission.csv`
 
-**Saved model files (retrained):**
+**Сохранённые файлы моделей (после полного дообучения):**
 ```
-models/model_np_type7_s0.txt          (LGBM per seed)
-models/model_np_type7_catboost_s0.cbm (CatBoost per seed)
+models/model_np_type7_s0.txt          (LGBM на seed)
+models/model_np_type7_catboost_s0.cbm (CatBoost на seed)
 models/model_np_other_s0.txt
-... (4 groups × 1+ seeds each)
+... (4 группы × 1+ seeds каждая)
 ```
 
 ---
 
-### `train_v2()` — Hierarchical ensemble (recommended)
+### `train_v2()` — Иерархический ансамбль (рекомендуется)
 
 ```
 scripts/training/pipeline_v2.py
 ```
 
-Replaces per-group CatBoost with a global hierarchical decomposition:
+Заменяет per-group CatBoost глобальным иерархическим разложением:
 
 ```
 P(fraud | tx)  ≈  P(labeled | tx)  ×  P(fraud | labeled, tx)
               =  sigmoid(susp_raw)  ×  sigmoid(rgs_raw)
 ```
 
-The hierarchical pair provides orthogonal signal to per-group LGBM because it is trained globally (sees cross-group patterns) and uses native CatBoost categorical handling.
+Иерархическая пара даёт ортогональный сигнал к per-group LGBM, поскольку обучается глобально (видит кросс-групповые паттерны) и использует нативную обработку категориальных признаков CatBoost.
 
-#### Step-by-step
+#### Пошаговое описание
 
-**Step 1 — Build memmaps** (same as `train_baseline`)
+**Шаг 1 — Построение memmap** (то же, что в `train_baseline`)
 
-**Step 2 — Pre-load val from parquet**
-- Loads labeled val rows from processed parquets into a pandas DataFrame
-- Also loads a 1%-sampled fraction of unlabeled val rows (for all-rows blend optimisation, `BLEND_ON_ALL_ROWS=True`)
-- Both labeled and sampled unlabeled rows are used in the blend weight grid search
+**Шаг 2 — Предзагрузка val из parquet**
+- Загружает labeled val-строки из обработанных parquet в pandas DataFrame
+- Также загружает 1%-выборку непомеченных val-строк (для оптимизации весов на all-rows, `BLEND_ON_ALL_ROWS=True`)
+- И labeled, и выбранные unlabeled строки используются при поиске весов смешивания
 
-**Step 3 — Per-group LightGBM** (same as `train_baseline` minus CatBoost)
-- 1 seed per group; each booster scores the pre-loaded val DataFrame before being freed
-- `lgbm_blend_sum` accumulates scores aligned to the val DataFrame index
+**Шаг 3 — Per-group LightGBM** (то же, что в `train_baseline`, без CatBoost)
+- 1 seed на группу; каждый бустер скорит предзагруженный val DataFrame перед освобождением памяти
+- `lgbm_blend_sum` накапливает скоры, выровненные по индексу val DataFrame
 
-**Step 4 — Hierarchical CatBoost data load**
-- `load_hier_split()` reads processed parquets, keeps:
-  - **All labeled rows** (red + yellow) from the train period
-  - **5% sampled green rows** (`HIER_FULL_GREEN_RATIO`) — deterministic hash-based sampling
-- Features: when `HIER_USE_ALL_FEATURES=True`, uses the full LGBM feature set + CatBoost categorical columns (`customer_id`, `mcc_code_int`)
+**Шаг 4 — Загрузка данных для иерархического CatBoost**
+- `load_hier_split()` читает обработанные parquet, оставляет:
+  - **Все labeled строки** (red + yellow) из периода train
+  - **5% выборка green-строк** (`HIER_FULL_GREEN_RATIO`) — детерминированная хеш-выборка
+- Признаки: при `HIER_USE_ALL_FEATURES=True` используется полный набор признаков LGBM + категориальные колонки CatBoost (`customer_id`, `mcc_code_int`)
 
-**Step 5 — Suspicious CatBoost** (target: `P(labeled | tx)`)
-- Training: (red ∪ yellow) as positive, green as negative
-- Sample weights:
-  - Labeled rows: `SUSPICIOUS_LABELED_WEIGHT = 6.0`
-  - Green rows from `RECENT_BORDER (2025-02-01)` onward: `SUSPICIOUS_GREEN_RECENT_W = 1.5`
-  - Older green rows: `SUSPICIOUS_GREEN_OLD_W = 3.0` (reliably non-fraud — higher penalty)
-- Eval metric: AUC on labeled val
-- Params: `SUSPICIOUS_CATBOOST_PARAMS` (3000 iterations, depth 8, l2=6.0)
+**Шаг 5 — Suspicious CatBoost** (цель: `P(labeled | tx)`)
+- Обучение: (red ∪ yellow) как позитивный класс, green как негативный
+- Веса примеров:
+  - Labeled строки: `SUSPICIOUS_LABELED_WEIGHT = 6.0`
+  - Green-строки начиная с `RECENT_BORDER (2025-02-01)`: `SUSPICIOUS_GREEN_RECENT_W = 1.5`
+  - Более старые green-строки: `SUSPICIOUS_GREEN_OLD_W = 3.0` (надёжно не-мошеннические — больший штраф)
+- Метрика валидации: AUC на labeled val
+- Параметры: `SUSPICIOUS_CATBOOST_PARAMS` (3000 итераций, глубина 8, l2=6.0)
 
-**Step 6 — RGS CatBoost** (target: `P(fraud | labeled, tx)`)
-- Training: labeled rows only — red (fraud) vs yellow (confirmed non-fraud)
-- Near-50% fraud rate produces a strong, clean signal
-- Sample weights: `RGS_RED_WEIGHT = 2.5`, `RGS_YELLOW_WEIGHT = 1.0`
-- Eval metric: PRAUC on labeled val
-- Params: `RGS_CATBOOST_PARAMS` (5000 iterations, depth 8, l2=8.0)
+**Шаг 6 — RGS CatBoost** (цель: `P(fraud | labeled, tx)`)
+- Обучение: только labeled строки — red (мошенничество) vs yellow (подтверждённые)
+- Близкое к 50% соотношение классов даёт чистый, сильный сигнал
+- Веса примеров: `RGS_RED_WEIGHT = 2.5`, `RGS_YELLOW_WEIGHT = 1.0`
+- Метрика валидации: PRAUC на labeled val
+- Параметры: `RGS_CATBOOST_PARAMS` (5000 итераций, глубина 8, l2=8.0)
 
-**Step 7 — Main CatBoost** (target: direct fraud prediction)
-- Global model: red=1 vs yellow+green=0
-- Weights: red=10.0, yellow=2.5, green_recent=1.5, green_old=3.0
-- Provides additional orthogonal signal via native CatBoost categorical handling
-- Params: `MAIN_CATBOOST_PARAMS` (5000 iterations, depth 8, l2=8.0)
+**Шаг 7 — Main CatBoost** (цель: прямое предсказание мошенничества)
+- Глобальная модель: red=1 vs yellow+green=0
+- Веса: red=10.0, yellow=2.5, green_recent=1.5, green_old=3.0
+- Даёт дополнительный ортогональный сигнал через нативную обработку категорий CatBoost
+- Параметры: `MAIN_CATBOOST_PARAMS` (5000 итераций, глубина 8, l2=8.0)
 
-**Step 8 — Optional Recent LightGBM** (`TRAIN_RECENT_LGBM=True`)
-- Single global LGBM trained on data from `RECENT_BORDER (2025-02-01)` onward
-- Captures temporal drift in fraud patterns as the test period approaches
-- `LGBM_PARAMS_RECENT`: LR=0.02, 2000 estimators
+**Шаг 8 — Опциональный Recent LightGBM** (`TRAIN_RECENT_LGBM=True`)
+- Один глобальный LGBM, обученный на данных начиная с `RECENT_BORDER (2025-02-01)`
+- Захватывает временной дрейф паттернов мошенничества по мере приближения к тестовому периоду
+- `LGBM_PARAMS_RECENT`: LR=0.02, 2000 деревьев
 
-**Step 9 — Blend weight optimisation**
-- Scores all models on the pre-loaded val DataFrame
-- Hierarchical score: `sigmoid(susp_raw) × sigmoid(rgs_raw)`
-- Blend: `final = w_lgbm * lgbm + w_hier * hier + w_main * main + w_recent * recent`
-- When `BLEND_IN_LOGIT_SPACE=True`, blending is done in logit space (better-calibrated)
-- When `BLEND_ON_ALL_ROWS=True`, optimises on labeled + sampled unlabeled val rows
-- Grid search over the 4-weight simplex; best weights reported
+**Шаг 9 — Оптимизация весов смешивания**
+- Скорит все модели на предзагруженном val DataFrame
+- Иерархический скор: `sigmoid(susp_raw) × sigmoid(rgs_raw)`
+- Смешивание: `final = w_lgbm * lgbm + w_hier * hier + w_main * main + w_recent * recent`
+- При `BLEND_IN_LOGIT_SPACE=True` смешивание выполняется в пространстве логитов (лучше откалибровано)
+- При `BLEND_ON_ALL_ROWS=True` оптимизируется на labeled + выбранных unlabeled val-строках
+- Перебор по симплексу из 4 весов; лучшие веса выводятся в лог
 
-**Step 10 — Full-data retraining**
-- Per-group LGBM: retrained from memmaps, `best_iter × RETRAIN_FULL_ITER_FACTOR` rounds
-- Hierarchical CatBoost: refitted with `refit_model()` on extended data (`cutoff_hi = TRAIN_END_DATE`)
-- Main CatBoost: refitted on full data
-- Recent LGBM: retrained on data up to `TRAIN_END_DATE`
+**Шаг 10 — Дообучение на полных данных**
+- Per-group LGBM: переобучение из memmap, `best_iter × RETRAIN_FULL_ITER_FACTOR` раундов
+- Иерархический CatBoost: дообучение через `refit_model()` на расширенных данных (`cutoff_hi = TRAIN_END_DATE`)
+- Main CatBoost: дообучение на полных данных
+- Recent LGBM: переобучение на данных вплоть до `TRAIN_END_DATE`
 
-**Step 11 — Test scoring**
-- For each test parquet chunk:
-  - LGBM score: per-group average
-  - Hierarchical score: `sigmoid(susp) × sigmoid(rgs)`
-  - Main CatBoost score
-  - Recent LGBM score
-  - Final: blended in logit space using optimised weights
-- Writes `submission.csv`
+**Шаг 11 — Скоринг теста**
+- Для каждого чанка тестового parquet:
+  - LGBM скор: среднее по группе
+  - Иерархический скор: `sigmoid(susp) × sigmoid(rgs)`
+  - Main CatBoost скор
+  - Recent LGBM скор
+  - Итог: смешивание в пространстве логитов с оптимизированными весами
+- Записывает `submission.csv`
 
-**Saved model files (retrained):**
+**Сохранённые файлы моделей (после полного дообучения):**
 ```
 models/model_np_type7_s0.txt    (per-group LGBM)
 models/model_np_other_s0.txt
 models/model_card_s0.txt
 models/model_p2p_s0.txt
-models/model_suspicious.cbm    (global Suspicious CatBoost)
-models/model_rgs.cbm           (global RGS CatBoost)
-models/model_main_catboost.cbm (global Main CatBoost)
-models/model_recent.txt        (global Recent LGBM)
+models/model_suspicious.cbm    (глобальный Suspicious CatBoost)
+models/model_rgs.cbm           (глобальный RGS CatBoost)
+models/model_main_catboost.cbm (глобальный Main CatBoost)
+models/model_recent.txt        (глобальный Recent LGBM)
 ```
 
-Old model files are automatically archived as `model_*_ver_N.*` before each training run.
+Существующие файлы моделей автоматически архивируются как `model_*_ver_N.*` перед каждым запуском обучения.
 
 ---
 
-## Configuration Reference
+## Справочник конфигурации
 
-All tuneable constants live in `scripts/training/config.py`. Key knobs:
+Все настраиваемые константы находятся в `scripts/training/config.py`. Ключевые параметры:
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `VAL_CUTOFF_DATE` | `2025-04-01` | Train/val split boundary |
-| `TRAIN_END_DATE` | `2025-06-01` | Val/test boundary |
-| `NEG_SAMPLE_RATIO_BY_GROUP` | 0.05 all groups | Negative undersampling ratio |
-| `YELLOW_WEIGHT_MULTIPLIER` | 2.0 | Extra weight for labeled negatives |
-| `ENSEMBLE_SEEDS` | `[42]` | LGBM seeds (list → multi-seed averaging) |
-| `RETRAIN_FULL_ITER_FACTOR` | 1.05 | Extra rounds for full-data retraining |
-| `RECENT_BORDER` | `2025-02-01` | Start of "recent" window for Recent LGBM |
-| `BLEND_IN_LOGIT_SPACE` | `True` | Blend model outputs in logit space |
-| `BLEND_ON_ALL_ROWS` | `True` | Include sampled unlabeled rows in blend optimisation |
-| `HIER_USE_ALL_FEATURES` | `True` | Use full LGBM feature set for hierarchical CatBoost |
-| `TRAIN_RECENT_LGBM` | `True` | Train a global recent-data LGBM |
-| `FEATURE_BLACKLIST` | 15 features | Zero-gain features excluded from all models |
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `VAL_CUTOFF_DATE` | `2025-04-01` | Граница разбиения train/val |
+| `TRAIN_END_DATE` | `2025-06-01` | Граница разбиения val/test |
+| `NEG_SAMPLE_RATIO_BY_GROUP` | 0.05 для всех групп | Коэффициент undersampling негативов |
+| `YELLOW_WEIGHT_MULTIPLIER` | 2.0 | Дополнительный вес для labeled негативов |
+| `ENSEMBLE_SEEDS` | `[42]` | Seeds для LGBM (список → усреднение по нескольким seeds) |
+| `RETRAIN_FULL_ITER_FACTOR` | 1.05 | Дополнительные раунды при дообучении на полных данных |
+| `RECENT_BORDER` | `2025-02-01` | Начало «недавнего» окна для Recent LGBM |
+| `BLEND_IN_LOGIT_SPACE` | `True` | Смешивать выходы моделей в пространстве логитов |
+| `BLEND_ON_ALL_ROWS` | `True` | Включать выборку unlabeled строк в оптимизацию весов |
+| `HIER_USE_ALL_FEATURES` | `True` | Использовать полный набор признаков LGBM для иерархического CatBoost |
+| `TRAIN_RECENT_LGBM` | `True` | Обучать глобальный Recent LGBM |
+| `FEATURE_BLACKLIST` | 15 признаков | Признаки с нулевым gain, исключённые из всех моделей |
 
 ---
 
-## Hardware & Environment
+## Железо и окружение
 
-- **CPU only, 32 GB RAM** — no GPU required (GPU support via `train_v2(gpu=True)`)
+- **Только CPU, 32 ГБ RAM** — GPU не требуется (поддержка GPU через `train_v2(gpu=True)`)
 - Python 3.11, Polars 1.x, LightGBM, CatBoost, scikit-learn, NumPy, pandas
-- Feature engineering processes one customer partition at a time (50 partitions)
-- Training uses numpy memmaps to avoid loading all features into RAM simultaneously
-- Output features are downcast to float32/int32 to halve disk and memory usage
+- Feature engineering обрабатывает одну партицию клиентов за раз (50 партиций)
+- Обучение использует numpy memmap, чтобы не загружать все признаки в RAM одновременно
+- Выходные признаки приводятся к float32/int32, что вдвое сокращает использование диска и памяти

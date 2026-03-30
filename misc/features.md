@@ -1,642 +1,642 @@
-# Feature Catalogue
+# Каталог признаков
 
-All engineered features produced by the pipeline (`scripts/features/`).
-Organized by section in the order they are computed: A -> B -> K -> D -> E -> F -> G -> H -> I -> J.
+Все инженерные признаки, производимые пайплайном (`scripts/features/`).
+Организованы по секциям в порядке вычисления: A -> B -> K -> D -> E -> F -> G -> H -> I -> J.
 
-Columns dropped before final output: `temp_row_idx`, `amount_clean`, `channel_mean`, `channel_std`, `mcc_mean`, `mcc_std`, `_fb_target`, `_fb_is_red`, `_fb_is_yellow`, `_fb_is_labeled`.
-String raw columns (`mcc_code`, `accept_language`, `browser_language`, `battery`, `device_system_version`, `screen_size`, `developer_tools`, `compromised`) are excluded from the LightGBM feature set via `NON_FEATURE_COLS` in `training/config.py`.
-`model_group` is a routing key only, also excluded from the model feature set.
-
----
-
-## Section A -- Transaction-Level (`transaction.py`)
-
-| Feature | Description |
-|---------|-------------|
-| `hour` | Hour of day (0-23) extracted from `event_dttm` |
-| `day_of_week` | Day of week (0=Monday ... 6=Sunday) |
-| `day_of_month` | Day of month (1-31) |
-| `week_of_year` | ISO week number within the year |
-| `hour_of_day` | Alias of `hour` |
-| `is_weekend` | 1 if transaction falls on Saturday or Sunday |
-| `is_night` | 1 if hour <= 6 |
-| `is_working_hour` | 1 if hour is between 9 and 18 |
-| `minutes_from_midnight` | Minutes elapsed since midnight (hour x 60 + minute) |
-| `log_amount` | log1p of transaction amount; compresses large outliers |
-| `amount_abs` | Absolute value of transaction amount |
-| `amount_round_100` | 1 if amount is divisible by 100 (round-number flag) |
-| `amount_round_1000` | 1 if amount is divisible by 1000 |
-| `amount_currency_mismatch_flag` | 1 if `currency_iso_cd` is null |
-| `is_month_start` | 1 if day in {1, 2, 3} -- early-month payday period |
-| `is_month_end` | 1 if day in {28, 29, 30, 31} -- end-of-month period |
-| `is_payday` | 1 if day in {1, 15, 25} -- common Russian salary days |
-| `is_holiday` | 1 if date matches a Russian federal public holiday |
-| `tx_type_group` | Transaction type: 0=non-payment, 1=card, 2=P2P |
-| `model_group` | Model routing key: 0=np_type7, 1=np_other, 2=card, 3=p2p (**not a model feature**) |
-| `channel_type_subtype` | Combined `channel_indicator_type * 1000 + channel_indicator_sub_type` (Int32) |
-| `evtype_channel` | Combined `event_type_nm * 1000 + channel_indicator_type` (Int32) |
-| `evtype_subchannel` | Combined `event_type_nm * 1000 + channel_indicator_sub_type` (Int32) |
-| `amount_card` | Transaction amount if card (`tx_type_group==1`), else 0; used for rolling card spend |
-| `amount_p2p` | Transaction amount if P2P (`tx_type_group==2`), else 0; used for rolling P2P spend |
+Колонки, удаляемые перед финальным выводом: `temp_row_idx`, `amount_clean`, `channel_mean`, `channel_std`, `mcc_mean`, `mcc_std`, `_fb_target`, `_fb_is_red`, `_fb_is_yellow`, `_fb_is_labeled`.
+Строковые исходные колонки (`mcc_code`, `accept_language`, `browser_language`, `battery`, `device_system_version`, `screen_size`, `developer_tools`, `compromised`) исключены из набора признаков LightGBM через `NON_FEATURE_COLS` в `training/config.py`.
+`model_group` — только ключ маршрутизации, также исключён из набора признаков модели.
 
 ---
 
-## Section B -- Behavioural & User History (`behavioral.py`)
+## Секция A -- Уровень транзакции (`transaction.py`)
 
-All features are computed cumulatively (prior rows only; current row excluded via `cum_count() - 1` shift).
-
-### Cumulative counts
-
-| Feature | Description |
-|---------|-------------|
-| `tx_count_lifetime` | Total number of prior transactions for this customer |
-| `time_since_last_tx_minutes` | Minutes elapsed since the customer's previous transaction |
-| `mcc_freq_user_cum` | How many times this customer has used this MCC code before |
-| `pos_freq_user_cum` | How many times this customer has used this POS code before |
-| `event_desc_user_freq` | How many times this customer has used this `event_desc` before |
-| `event_type_user_freq` | How many times this customer has used this `event_type_nm` before |
-
-### Derived behavioural
-
-| Feature | Description |
-|---------|-------------|
-| `mcc_transaction_share_user` | Fraction of customer's prior transactions at this MCC |
-| `pos_cd_transaction_share_user` | Fraction of customer's prior transactions at this POS |
-| `merchant_switch_flag` | 1 if MCC code differs from the previous transaction |
-| `time_since_last_3_tx_mean` | Rolling mean of the last 3 inter-transaction gaps (minutes) |
-| `mcc_frequency_user` | Alias of `mcc_freq_user_cum` |
-| `event_desc_is_new_for_user` | 1 if this `event_desc` has never appeared in this customer's history |
-| `event_type_is_new_for_user` | 1 if this `event_type_nm` has never appeared in this customer's history |
-| `event_desc_share_user` | Fraction of customer's prior transactions with this `event_desc` |
-
-### Lag features (n = 1 ... 5)
-
-| Feature | Description |
-|---------|-------------|
-| `prev_{n}_op_type` | `event_type_nm` of the n-th previous transaction (-1 if absent) |
-| `prev_{n}_op_desc` | `event_desc` of the n-th previous transaction (-1 if absent) |
-| `prev_{n}_op_channel` | `channel_indicator_type` of the n-th previous transaction (-1 if absent) |
-| `prev_{n}_op_subchannel` | `channel_indicator_sub_type` of the n-th previous transaction (-1 if absent) |
-| `prev_1_op_timediff` | Minutes since last transaction (alias of `time_since_last_tx_minutes`) |
-
-### Running-max features (leakage-free via `cum_max().shift(1)`)
-
-| Feature | Description |
-|---------|-------------|
-| `operaton_amt_max_prev` | Maximum amount from all prior customer transactions |
-| `operaton_amt_mcc_max_prev` | Maximum amount prior for this (customer, MCC) pair |
-| `operaton_amt_type_max_prev` | Maximum amount prior for this (customer, channel_indicator_type) pair |
-| `operaton_amt_desc_max_prev` | Maximum amount prior for this (customer, event_desc) pair |
-| `operaton_amt_sub_max_prev` | Maximum amount prior for this (customer, channel_indicator_sub_type) pair |
-| `operaton_amt_type_subtype_max_prev` | Maximum amount prior for this (customer, channel_type_subtype) pair |
-| `operaton_amt_evtype_channel_max_prev` | Maximum amount prior for this (customer, evtype_channel) pair |
-| `operaton_amt_evtype_subchannel_max_prev` | Maximum amount prior for this (customer, evtype_subchannel) pair |
-| `operaton_amt_evtype_mcc_max_prev` | Maximum amount prior for this (customer, event_type_nm, mcc_code) triple |
-
-### Log-frequency features (`log1p(prior_count)`)
-
-| Feature | Description |
-|---------|-------------|
-| `event_desc_log_count` | log1p of `event_desc_user_freq` |
-| `mcc_log_count` | log1p of `mcc_freq_user_cum` |
-| `pos_cd_log_count` | log1p of `pos_freq_user_cum` |
-| `event_type_nm_log_count` | log1p of `event_type_user_freq` |
-| `timezone_log_count` | log1p of per-(customer, timezone) prior count |
-| `operating_system_type_log_count` | log1p of per-(customer, OS) prior count |
-| `channel_indicator_type_log_count` | log1p of per-(customer, channel_type) prior count |
-| `channel_type_subtype_log_count` | log1p of per-(customer, channel_type_subtype) prior count |
-| `evtype_channel_log_count` | log1p of per-(customer, evtype_channel) prior count |
-| `evtype_subchannel_log_count` | log1p of per-(customer, evtype_subchannel) prior count |
-| `evtype_mcc_log_count` | log1p of per-(customer, event_type_nm, mcc_code) prior count |
-| `device_system_version_log_count` | log1p of per-(customer, OS version) prior count |
-| `compromised_log_count` | log1p of per-(customer, compromised state) prior count |
-| `developer_tools_log_count` | log1p of per-(customer, developer_tools) prior count |
-| `browser_language_log_count` | log1p of per-(customer, browser_language) prior count |
-| `currency_iso_cd_log_count` | log1p of per-(customer, currency) prior count |
-| `phone_voip_call_state_log_count` | log1p of per-(customer, VoIP state) prior count |
-| `web_rdp_connection_log_count` | log1p of per-(customer, RDP state) prior count |
-
-### Same-as-previous flags
-
-| Feature | Description |
-|---------|-------------|
-| `pos_cd_prev` | 1 if POS code matches the previous transaction |
-| `currency_iso_cd_prev` | 1 if currency matches the previous transaction |
+| Признак | Описание |
+|---------|----------|
+| `hour` | Час суток (0-23), извлечённый из `event_dttm` |
+| `day_of_week` | День недели (0=понедельник ... 6=воскресенье) |
+| `day_of_month` | День месяца (1-31) |
+| `week_of_year` | ISO-номер недели в году |
+| `hour_of_day` | Псевдоним `hour` |
+| `is_weekend` | 1, если транзакция совершена в субботу или воскресенье |
+| `is_night` | 1, если час <= 6 |
+| `is_working_hour` | 1, если час от 9 до 18 |
+| `minutes_from_midnight` | Минут с начала суток (hour x 60 + minute) |
+| `log_amount` | log1p суммы транзакции; сжимает крупные выбросы |
+| `amount_abs` | Абсолютное значение суммы транзакции |
+| `amount_round_100` | 1, если сумма делится на 100 (признак круглой суммы) |
+| `amount_round_1000` | 1, если сумма делится на 1000 |
+| `amount_currency_mismatch_flag` | 1, если `currency_iso_cd` равно null |
+| `is_month_start` | 1, если день входит в {1, 2, 3} — начало месяца / зарплатный период |
+| `is_month_end` | 1, если день входит в {28, 29, 30, 31} — конец месяца |
+| `is_payday` | 1, если день входит в {1, 15, 25} — типичные дни выплаты зарплаты в России |
+| `is_holiday` | 1, если дата совпадает с федеральным праздником России |
+| `tx_type_group` | Тип транзакции: 0=non-payment, 1=card, 2=P2P |
+| `model_group` | Ключ маршрутизации модели: 0=np_type7, 1=np_other, 2=card, 3=p2p (**не является признаком модели**) |
+| `channel_type_subtype` | Комбинация `channel_indicator_type * 1000 + channel_indicator_sub_type` (Int32) |
+| `evtype_channel` | Комбинация `event_type_nm * 1000 + channel_indicator_type` (Int32) |
+| `evtype_subchannel` | Комбинация `event_type_nm * 1000 + channel_indicator_sub_type` (Int32) |
+| `amount_card` | Сумма транзакции для card (`tx_type_group==1`), иначе 0; используется для rolling card spend |
+| `amount_p2p` | Сумма транзакции для P2P (`tx_type_group==2`), иначе 0; используется для rolling P2P spend |
 
 ---
 
-## Section K -- Dynamic Label Feedback (`feedback.py`)
+## Секция B -- Поведение и история клиента (`behavioral.py`)
 
-Per-customer cumulative statistics from the label history (red=fraud, yellow=confirmed non-fraud).
-All features use strictly prior information (`cum_sum() - current` or `shift(1) + forward_fill`).
-When `labels_lf` is not provided, all features default to zero/smoothing prior.
+Все признаки вычисляются накопительно (только предыдущие строки; текущая строка исключена через сдвиг `cum_count() - 1`).
 
-### Per-customer label counts and rates
+### Накопительные счётчики
 
-| Feature | Description |
-|---------|-------------|
-| `fb_cust_prev_red_cnt` | Count of prior fraud labels for this customer |
-| `fb_cust_prev_yellow_cnt` | Count of prior non-fraud labels |
-| `fb_cust_prev_labeled_cnt` | Count of prior labeled transactions |
-| `fb_cust_prev_red_rate` | Smoothed fraud rate among prior labeled: `(red + 0.1) / (labeled + 1)` |
-| `fb_cust_prev_yellow_rate` | Smoothed non-fraud rate among prior labeled |
-| `fb_cust_prev_susp_rate` | Fraction of all prior events that were labeled |
-| `fb_cust_prev_any_red` | Ever had a fraud label (binary) |
-| `fb_cust_prev_any_yellow` | Ever had a non-fraud label (binary) |
+| Признак | Описание |
+|---------|----------|
+| `tx_count_lifetime` | Суммарное число предыдущих транзакций данного клиента |
+| `time_since_last_tx_minutes` | Минут с момента предыдущей транзакции клиента |
+| `mcc_freq_user_cum` | Сколько раз клиент использовал этот MCC ранее |
+| `pos_freq_user_cum` | Сколько раз клиент использовал этот POS ранее |
+| `event_desc_user_freq` | Сколько раз клиент использовал этот `event_desc` ранее |
+| `event_type_user_freq` | Сколько раз клиент использовал этот `event_type_nm` ранее |
 
-### Time since last label
+### Производные поведенческие признаки
 
-| Feature | Description |
-|---------|-------------|
-| `fb_sec_since_prev_red` | Seconds since last fraud label (-1 if none) |
-| `fb_sec_since_prev_yellow` | Seconds since last non-fraud label (-1 if none) |
+| Признак | Описание |
+|---------|----------|
+| `mcc_transaction_share_user` | Доля предыдущих транзакций клиента в данном MCC |
+| `pos_cd_transaction_share_user` | Доля предыдущих транзакций клиента в данном POS |
+| `merchant_switch_flag` | 1, если MCC отличается от предыдущей транзакции |
+| `time_since_last_3_tx_mean` | Скользящее среднее последних 3 межтранзакционных интервалов (минуты) |
+| `mcc_frequency_user` | Псевдоним `mcc_freq_user_cum` |
+| `event_desc_is_new_for_user` | 1, если этот `event_desc` ни разу не встречался в истории клиента |
+| `event_type_is_new_for_user` | 1, если этот `event_type_nm` ни разу не встречался в истории клиента |
+| `event_desc_share_user` | Доля предыдущих транзакций клиента с данным `event_desc` |
 
-### Per-(customer, event_desc) label stats
+### Лаговые признаки (n = 1 ... 5)
 
-| Feature | Description |
-|---------|-------------|
-| `fb_desc_prev_red_cnt` | Prior fraud count for (customer, event_desc) |
-| `fb_desc_prev_yellow_cnt` | Prior non-fraud count for (customer, event_desc) |
-| `fb_desc_prev_labeled_cnt` | Prior labeled count for (customer, event_desc) |
-| `fb_desc_prev_red_rate` | Smoothed fraud rate for (customer, event_desc) |
+| Признак | Описание |
+|---------|----------|
+| `prev_{n}_op_type` | `event_type_nm` n-й предыдущей транзакции (-1, если отсутствует) |
+| `prev_{n}_op_desc` | `event_desc` n-й предыдущей транзакции (-1, если отсутствует) |
+| `prev_{n}_op_channel` | `channel_indicator_type` n-й предыдущей транзакции (-1, если отсутствует) |
+| `prev_{n}_op_subchannel` | `channel_indicator_sub_type` n-й предыдущей транзакции (-1, если отсутствует) |
+| `prev_1_op_timediff` | Минут с последней транзакции (псевдоним `time_since_last_tx_minutes`) |
 
-### Per-(customer, event_type_nm) label stats
+### Running-max признаки (без утечки данных, через `cum_max().shift(1)`)
 
-| Feature | Description |
-|---------|-------------|
-| `fb_type_prev_red_cnt` | Prior fraud count for (customer, event_type_nm) |
-| `fb_type_prev_labeled_cnt` | Prior labeled count for (customer, event_type_nm) |
-| `fb_type_prev_red_rate` | Smoothed fraud rate for (customer, event_type_nm) |
+| Признак | Описание |
+|---------|----------|
+| `operaton_amt_max_prev` | Максимальная сумма среди всех предыдущих транзакций клиента |
+| `operaton_amt_mcc_max_prev` | Максимальная сумма ранее для пары (клиент, MCC) |
+| `operaton_amt_type_max_prev` | Максимальная сумма ранее для пары (клиент, channel_indicator_type) |
+| `operaton_amt_desc_max_prev` | Максимальная сумма ранее для пары (клиент, event_desc) |
+| `operaton_amt_sub_max_prev` | Максимальная сумма ранее для пары (клиент, channel_indicator_sub_type) |
+| `operaton_amt_type_subtype_max_prev` | Максимальная сумма ранее для пары (клиент, channel_type_subtype) |
+| `operaton_amt_evtype_channel_max_prev` | Максимальная сумма ранее для пары (клиент, evtype_channel) |
+| `operaton_amt_evtype_subchannel_max_prev` | Максимальная сумма ранее для пары (клиент, evtype_subchannel) |
+| `operaton_amt_evtype_mcc_max_prev` | Максимальная сумма ранее для тройки (клиент, event_type_nm, mcc_code) |
 
-### Per-(customer, channel_indicator_sub_type) label stats
+### Log-частотные признаки (`log1p(prior_count)`)
 
-| Feature | Description |
-|---------|-------------|
-| `fb_subchan_prev_red_cnt` | Prior fraud count for (customer, subchannel) |
-| `fb_subchan_prev_labeled_cnt` | Prior labeled count for (customer, subchannel) |
-| `fb_subchan_prev_red_rate` | Smoothed fraud rate for (customer, subchannel) |
+| Признак | Описание |
+|---------|----------|
+| `event_desc_log_count` | log1p от `event_desc_user_freq` |
+| `mcc_log_count` | log1p от `mcc_freq_user_cum` |
+| `pos_cd_log_count` | log1p от `pos_freq_user_cum` |
+| `event_type_nm_log_count` | log1p от `event_type_user_freq` |
+| `timezone_log_count` | log1p от числа предыдущих вхождений (клиент, timezone) |
+| `operating_system_type_log_count` | log1p от числа предыдущих вхождений (клиент, OS) |
+| `channel_indicator_type_log_count` | log1p от числа предыдущих вхождений (клиент, channel_type) |
+| `channel_type_subtype_log_count` | log1p от числа предыдущих вхождений (клиент, channel_type_subtype) |
+| `evtype_channel_log_count` | log1p от числа предыдущих вхождений (клиент, evtype_channel) |
+| `evtype_subchannel_log_count` | log1p от числа предыдущих вхождений (клиент, evtype_subchannel) |
+| `evtype_mcc_log_count` | log1p от числа предыдущих вхождений (клиент, event_type_nm, mcc_code) |
+| `device_system_version_log_count` | log1p от числа предыдущих вхождений (клиент, версия OS) |
+| `compromised_log_count` | log1p от числа предыдущих вхождений (клиент, состояние compromised) |
+| `developer_tools_log_count` | log1p от числа предыдущих вхождений (клиент, developer_tools) |
+| `browser_language_log_count` | log1p от числа предыдущих вхождений (клиент, browser_language) |
+| `currency_iso_cd_log_count` | log1p от числа предыдущих вхождений (клиент, валюта) |
+| `phone_voip_call_state_log_count` | log1p от числа предыдущих вхождений (клиент, VoIP state) |
+| `web_rdp_connection_log_count` | log1p от числа предыдущих вхождений (клиент, RDP state) |
 
----
+### Флаги совпадения с предыдущей транзакцией
 
-## Section D -- Rolling Window Statistics (`rolling.py`)
-
-All windows use `closed="left"` -- the interval is `[t - period, t)`, so the current transaction is never included (no leakage).
-
-### Base rolling statistics -- 9 windows x 14 metrics = 126 features
-
-Windows: **15m**, **1h**, **6h**, **12h**, **1d**, **3d**, **7d**, **30d**, **90d**
-
-For each window suffix `{W}` the following columns are produced:
-
-| Feature | Description |
-|---------|-------------|
-| `amount_mean_{W}` | Mean transaction amount in the window |
-| `amount_std_{W}` | Standard deviation of amounts in the window |
-| `amount_median_{W}` | Median transaction amount in the window |
-| `amount_max_{W}` | Maximum transaction amount in the window |
-| `amount_min_{W}` | Minimum transaction amount in the window |
-| `cumulative_spend_{W}` | Total spend in the window |
-| `card_spend_{W}` | Total card-type spend in the window |
-| `p2p_spend_{W}` | Total P2P-type spend in the window |
-| `tx_count_{W}` | Number of transactions in the window |
-| `channel_diversity_{W}` | Number of distinct channel types used in the window |
-| `device_diversity_{W}` | Number of distinct OS types used in the window |
-| `merchant_diversity_{W}` | Number of distinct MCC codes used in the window |
-| `event_desc_diversity_{W}` | Number of distinct event_desc values used in the window |
-| `event_type_diversity_{W}` | Number of distinct event_type_nm values used in the window |
-
-### Sub-day derived features
-
-| Feature | Description |
-|---------|-------------|
-| `burst_flag_1h` | 1 if more than 5 transactions in the last 1 hour |
-| `spend_ratio_15m_vs_1d` | Fraction of daily spend that occurred in the last 15 minutes |
-| `spend_ratio_1h_vs_1d` | Fraction of daily spend that occurred in the last 1 hour |
-| `spend_ratio_6h_vs_1d` | Fraction of daily spend that occurred in the last 6 hours |
-| `spend_ratio_12h_vs_1d` | Fraction of daily spend that occurred in the last 12 hours |
-| `tx_count_ratio_15m_vs_1h` | Fraction of the hour's transaction count in the last 15 minutes |
-| `tx_count_ratio_1h_vs_1d` | Fraction of the day's transaction count in the last 1 hour |
-| `amount_ratio_to_mean_1h` | Current amount divided by the mean amount over the last 1 hour |
-| `amount_ratio_to_mean_6h` | Current amount divided by the mean amount over the last 6 hours |
-
-### Day+ derived features
-
-| Feature | Description |
-|---------|-------------|
-| `amount_rank_percentile_7d` | Position of current amount in the 7d [min, max] range (0-1) |
-| `amount_rank_percentile_30d` | Position of current amount in the 30d [min, max] range (0-1) |
-| `amount_rank_percentile_90d` | Position of current amount in the 90d [min, max] range (0-1) |
-| `amount_zscore_30d` | Z-score of current amount relative to 30d mean and std |
-| `amount_ratio_to_mean_30d` | Current amount divided by the 30d mean amount |
-| `avg_tx_per_day_30d` | Average number of transactions per day over last 30 days |
-| `spend_velocity_1d` | Average daily spend derived from 30d total (`cumulative_spend_30d / 30`) |
-| `tx_count_ratio_7d_vs_90d` | Ratio of 7d transaction count to 90d transaction count |
-| `amount_mean_ratio_7d_vs_90d` | Ratio of 7d mean amount to 30d mean amount |
-| `amount_diff_from_prev` | Difference between current and previous transaction amount |
-| `amount_ratio_prev` | Ratio of current to previous transaction amount |
-| `burst_flag` | 1 if time since previous transaction < 5 minutes |
-| `spend_ratio_1d_vs_30d` | Fraction of 30d spend that occurred in the last 1 day |
-| `spend_ratio_1d_vs_90d` | Fraction of 90d spend that occurred in the last 1 day |
-| `spend_ratio_7d_vs_90d` | Fraction of 90d spend that occurred in the last 7 days |
-| `spend_velocity_7d` | Average daily spend over last 7 days (`cumulative_spend_7d / 7`) |
-| `spend_velocity_30d` | Average daily spend over last 30 days (`cumulative_spend_30d / 30`) |
-| `amount_top5pct_30d` | 1 if amount is in the top 5% of the 30d min-max range |
-| `amount_top1pct_90d` | 1 if amount is in the top 1% of the 90d min-max range |
-| `amount_above_personal_max_flag` | 1 if amount exceeds the customer's personal maximum in the last 90 days |
-
-### Per-combination cumulative lifetime stats (leakage-free)
-
-| Feature | Description |
-|---------|-------------|
-| `spend_in_channel_lifetime` | Prior cumulative spend for this (customer, channel_indicator_type) |
-| `tx_count_in_channel_lifetime` | Prior cumulative tx count for this (customer, channel_indicator_type) |
-| `spend_in_channel_type_subtype_lifetime` | Prior cumulative spend for this (customer, channel_type_subtype) |
-| `tx_count_in_channel_type_subtype_lifetime` | Prior cumulative tx count for this (customer, channel_type_subtype) |
-| `spend_in_evtype_channel_lifetime` | Prior cumulative spend for this (customer, evtype_channel) |
-| `tx_count_in_evtype_channel_lifetime` | Prior cumulative tx count for this (customer, evtype_channel) |
-| `spend_in_evtype_subchannel_lifetime` | Prior cumulative spend for this (customer, evtype_subchannel) |
-| `tx_count_in_evtype_subchannel_lifetime` | Prior cumulative tx count for this (customer, evtype_subchannel) |
-| `spend_in_evtype_mcc_lifetime` | Prior cumulative spend for this (customer, event_type_nm, mcc_code) |
-| `tx_count_in_evtype_mcc_lifetime` | Prior cumulative tx count for this (customer, event_type_nm, mcc_code) |
-
-### Usage shares
-
-| Feature | Description |
-|---------|-------------|
-| `channel_usage_share` | Fraction of lifetime transactions in this channel_indicator_type |
-| `channel_type_subtype_usage_share` | Fraction of lifetime transactions in this channel_type_subtype |
-| `evtype_channel_usage_share` | Fraction of lifetime transactions in this evtype_channel |
-| `evtype_subchannel_usage_share` | Fraction of lifetime transactions in this evtype_subchannel |
-| `evtype_mcc_usage_share` | Fraction of lifetime transactions in this (event_type_nm, mcc_code) |
-
-### Card vs P2P spend fractions
-
-| Feature | Description |
-|---------|-------------|
-| `card_fraction_1d` | Card spend / total spend in last 1d |
-| `p2p_fraction_1d` | P2P spend / total spend in last 1d |
-| `card_fraction_7d` | Card spend / total spend in last 7d |
-| `card_fraction_30d` | Card spend / total spend in last 30d |
-| `p2p_fraction_30d` | P2P spend / total spend in last 30d |
-| `card_fraction_90d` | Card spend / total spend in last 90d |
-| `p2p_fraction_90d` | P2P spend / total spend in last 90d |
-
-### Card / P2P cross-window spend ratios
-
-| Feature | Description |
-|---------|-------------|
-| `card_spend_ratio_1d_vs_30d` | Card spend 1d / card spend 30d |
-| `p2p_spend_ratio_1d_vs_30d` | P2P spend 1d / P2P spend 30d |
-| `card_spend_ratio_1d_vs_90d` | Card spend 1d / card spend 90d |
-| `p2p_spend_ratio_1d_vs_90d` | P2P spend 1d / P2P spend 90d |
-| `card_spend_ratio_7d_vs_90d` | Card spend 7d / card spend 90d |
-| `p2p_spend_ratio_7d_vs_90d` | P2P spend 7d / P2P spend 90d |
-
-### Card-to-P2P balance ratios
-
-| Feature | Description |
-|---------|-------------|
-| `card_vs_p2p_ratio_1d` | Card spend 1d / P2P spend 1d |
-| `card_vs_p2p_ratio_30d` | Card spend 30d / P2P spend 30d |
-| `card_vs_p2p_ratio_90d` | Card spend 90d / P2P spend 90d |
+| Признак | Описание |
+|---------|----------|
+| `pos_cd_prev` | 1, если POS совпадает с предыдущей транзакцией |
+| `currency_iso_cd_prev` | 1, если валюта совпадает с предыдущей транзакцией |
 
 ---
 
-## Section E -- Device & Session Risk (`device.py`)
+## Секция K -- Динамическая обратная связь по меткам (`feedback.py`)
 
-### Device state flags
+Накопительная статистика по клиенту на основе истории меток (red=мошенничество, yellow=подтверждённая легитимная транзакция).
+Все признаки используют строго предшествующую информацию (`cum_sum() - current` или `shift(1) + forward_fill`).
+Если `labels_lf` не передан, все признаки по умолчанию равны нулю / значению сглаживающего prior.
 
-| Feature | Description |
-|---------|-------------|
-| `compromised_flag` | 1 if device has root/jailbreak access (`compromised = "true"`) |
-| `web_rdp_connection_flag` | 1 if device is under remote desktop control |
-| `developer_tools_flag` | 1 if developer settings are enabled on the device |
-| `phone_voip_call_flag` | 1 if a VoIP call was active during the transaction |
-| `low_battery_flag` | 1 if device battery level is below 15% |
+### Счётчики и ставки меток по клиенту
 
-### Device novelty flags (first-seen for this customer)
+| Признак | Описание |
+|---------|----------|
+| `fb_cust_prev_red_cnt` | Число предыдущих меток мошенничества у данного клиента |
+| `fb_cust_prev_yellow_cnt` | Число предыдущих меток подтверждённых легитимных транзакций |
+| `fb_cust_prev_labeled_cnt` | Число предыдущих размеченных транзакций |
+| `fb_cust_prev_red_rate` | Сглаженная частота мошенничества среди размеченных: `(red + 0.1) / (labeled + 1)` |
+| `fb_cust_prev_yellow_rate` | Сглаженная частота легитимных среди размеченных |
+| `fb_cust_prev_susp_rate` | Доля всех предыдущих событий, которые были размечены |
+| `fb_cust_prev_any_red` | Хотя бы одна метка мошенничества была ранее (бинарный) |
+| `fb_cust_prev_any_yellow` | Хотя бы одна метка легитимной транзакции была ранее (бинарный) |
 
-| Feature | Description |
-|---------|-------------|
-| `operating_system_is_new` | 1 if this OS type has never been seen for this customer |
-| `os_version_is_new` | 1 if this OS version string has never been seen for this customer |
-| `screen_size_is_new` | 1 if this screen resolution has never been seen for this customer |
-| `timezone_is_new` | 1 if this timezone has never been seen for this customer |
-| `accept_language_is_new` | 1 if this HTTP Accept-Language header has never been seen for this customer |
+### Время с момента последней метки
 
-### Device composite & session features
+| Признак | Описание |
+|---------|----------|
+| `fb_sec_since_prev_red` | Секунд с момента последней метки мошенничества (-1, если не было) |
+| `fb_sec_since_prev_yellow` | Секунд с момента последней легитимной метки (-1, если не было) |
 
-| Feature | Description |
-|---------|-------------|
-| `device_risk_score` | Weighted sum: `compromised x 5 + rdp x 3 + dev_tools x 2` |
-| `session_tx_count` | Number of prior transactions within the same session |
-| `session_amount_sum` | Total amount of prior transactions within the same session |
-| `session_channel_diversity` | 1 if channel type differs from the previous transaction in this session |
-| `session_length_estimate` | Alias of `session_tx_count` |
-| `session_mcc_switch` | 1 if MCC code differs from the previous transaction in this session |
-| `session_duration_minutes` | Minutes elapsed since the first transaction in this session |
-| `pause_ses` | Seconds since the previous transaction in the same session |
-| `screen_w` | Screen width in pixels (parsed from `screen_size` "WxH" string) |
-| `screen_h` | Screen height in pixels (parsed from `screen_size` "WxH" string) |
-| `session_avg_amount` | Average spend per transaction so far in this session |
-| `rdp_x_session_depth` | `rdp_flag x session_tx_count` -- remote session depth signal |
+### Статистики меток по (клиент, event_desc)
 
----
+| Признак | Описание |
+|---------|----------|
+| `fb_desc_prev_red_cnt` | Число предыдущих меток мошенничества для (клиент, event_desc) |
+| `fb_desc_prev_yellow_cnt` | Число предыдущих легитимных меток для (клиент, event_desc) |
+| `fb_desc_prev_labeled_cnt` | Число предыдущих размеченных записей для (клиент, event_desc) |
+| `fb_desc_prev_red_rate` | Сглаженная частота мошенничества для (клиент, event_desc) |
 
-## Section F -- Temporal & Global Frequencies (`temporal.py`)
+### Статистики меток по (клиент, event_type_nm)
 
-### Global frequency lookups (population-level, precomputed on training data)
+| Признак | Описание |
+|---------|----------|
+| `fb_type_prev_red_cnt` | Число предыдущих меток мошенничества для (клиент, event_type_nm) |
+| `fb_type_prev_labeled_cnt` | Число предыдущих размеченных записей для (клиент, event_type_nm) |
+| `fb_type_prev_red_rate` | Сглаженная частота мошенничества для (клиент, event_type_nm) |
 
-| Feature | Description |
-|---------|-------------|
-| `global_mcc_freq` | How often this MCC code appears across all training transactions |
-| `global_channel_freq` | How often this channel type appears across all training transactions |
-| `global_device_os_freq` | How often this OS type appears across all training transactions |
-| `global_timezone_freq` | How often this timezone appears across all training transactions |
-| `global_language_freq` | How often this Accept-Language header appears across all training transactions |
-| `global_pos_cd_freq` | How often this POS code appears across all training transactions |
-| `global_event_type_freq` | How often this event type appears across all training transactions |
-| `global_event_desc_freq` | How often this event description appears across all training transactions |
+### Статистики меток по (клиент, channel_indicator_sub_type)
 
-*If `global_stats` is not provided, each is replaced by a per-customer cumulative count (leakage-free fallback).*
-
-### Temporal & velocity features
-
-| Feature | Description |
-|---------|-------------|
-| `circadian_deviation_score` | Absolute difference between current hour and customer's historical mean hour |
-| `channel_shift_score` | 1 if channel type differs from the previous transaction |
-| `velocity_change_flag` | 1 if today's transaction count exceeds 2x the customer's 30d daily average |
-| `time_gap_variance_30d` | Std of inter-transaction gaps over the last 90 transactions (rolling) |
-| `time_gap_mean_30d` | Mean of inter-transaction gaps over the last 90 transactions (rolling) |
-| `time_gap_min_10tx` | Minimum inter-transaction gap among the last 10 gaps |
-| `time_gap_cv_30d` | Coefficient of variation of gaps: `std / mean` (scale-free irregularity) |
-| `new_device_flag` | 1 if this OS type is new for this customer (alias of `operating_system_is_new`) |
-| `merchant_entropy_user` | Fraction of customer's transactions at this MCC (`mcc_freq_user_cum / tx_count_lifetime`) |
-| `browser_language_mismatch` | 1 if `accept_language` != `browser_language` |
-
-### Combined risk signals
-
-| Feature | Description |
-|---------|-------------|
-| `rdp_and_large_amount_flag` | 1 if RDP active and amount > 1000 |
-| `amount_zscore_given_channel` | Amount vs. customer's cumulative mean spend in this channel |
-| `amount_zscore_given_mcc` | Amount vs. customer's cumulative mean spend at this MCC |
-| `amount_zscore_given_device` | Amount vs. customer's cumulative mean spend on this OS |
-| `tx_time_zscore_given_user` | Rolling std of transaction hours for this customer (temporal irregularity) |
+| Признак | Описание |
+|---------|----------|
+| `fb_subchan_prev_red_cnt` | Число предыдущих меток мошенничества для (клиент, subchannel) |
+| `fb_subchan_prev_labeled_cnt` | Число предыдущих размеченных записей для (клиент, subchannel) |
+| `fb_subchan_prev_red_rate` | Сглаженная частота мошенничества для (клиент, subchannel) |
 
 ---
 
-## Section G -- Z-Scores & Composite Flags (`zscore.py`)
+## Секция D -- Статистики скользящего окна (`rolling.py`)
 
-### Amount z-scores (global channel/MCC baselines)
+Все окна используют `closed="left"` — интервал `[t - period, t)`, поэтому текущая транзакция никогда не включается в своё окно (нет утечки данных).
 
-| Feature | Description |
-|---------|-------------|
-| `amount_zscore_channel` | Z-score of amount relative to the global mean/std for this channel |
-| `amount_zscore_mcc` | Z-score of amount relative to the global mean/std for this MCC |
+### Базовые rolling-статистики -- 9 окон x 14 метрик = 126 признаков
 
-### Combination & session
+Окна: **15m**, **1h**, **6h**, **12h**, **1d**, **3d**, **7d**, **30d**, **90d**
 
-| Feature | Description |
-|---------|-------------|
-| `global_combination_freq` | Population-level frequency of the (channel x OS) combination |
-| `session_first_tx_flag` | 1 if this is the first transaction in the session |
+Для каждого суффикса окна `{W}` производятся следующие колонки:
 
-### Change flags (vs. previous transaction)
+| Признак | Описание |
+|---------|----------|
+| `amount_mean_{W}` | Среднее значение суммы транзакций в окне |
+| `amount_std_{W}` | Стандартное отклонение суммы в окне |
+| `amount_median_{W}` | Медиана суммы транзакций в окне |
+| `amount_max_{W}` | Максимальная сумма транзакции в окне |
+| `amount_min_{W}` | Минимальная сумма транзакции в окне |
+| `cumulative_spend_{W}` | Суммарные траты в окне |
+| `card_spend_{W}` | Суммарные card-траты в окне |
+| `p2p_spend_{W}` | Суммарные P2P-траты в окне |
+| `tx_count_{W}` | Число транзакций в окне |
+| `channel_diversity_{W}` | Число уникальных типов каналов в окне |
+| `device_diversity_{W}` | Число уникальных типов OS в окне |
+| `merchant_diversity_{W}` | Число уникальных MCC кодов в окне |
+| `event_desc_diversity_{W}` | Число уникальных значений event_desc в окне |
+| `event_type_diversity_{W}` | Число уникальных значений event_type_nm в окне |
 
-| Feature | Description |
-|---------|-------------|
-| `language_change_flag` | 1 if `accept_language` differs from the previous transaction |
-| `os_change_flag` | 1 if OS type differs from the previous transaction |
-| `timezone_change_flag` | 1 if timezone differs from the previous transaction |
-| `rapid_sequence_flag` | 1 if time since the last transaction < 5 minutes |
+### Производные признаки субдневного масштаба
 
-### Composite risk flags
+| Признак | Описание |
+|---------|----------|
+| `burst_flag_1h` | 1, если за последний час совершено более 5 транзакций |
+| `spend_ratio_15m_vs_1d` | Доля дневных трат, совершённых за последние 15 минут |
+| `spend_ratio_1h_vs_1d` | Доля дневных трат, совершённых за последний час |
+| `spend_ratio_6h_vs_1d` | Доля дневных трат, совершённых за последние 6 часов |
+| `spend_ratio_12h_vs_1d` | Доля дневных трат, совершённых за последние 12 часов |
+| `tx_count_ratio_15m_vs_1h` | Доля часовых транзакций, совершённых за последние 15 минут |
+| `tx_count_ratio_1h_vs_1d` | Доля дневных транзакций, совершённых за последний час |
+| `amount_ratio_to_mean_1h` | Текущая сумма, делённая на среднюю сумму за последний час |
+| `amount_ratio_to_mean_6h` | Текущая сумма, делённая на среднюю сумму за последние 6 часов |
 
-| Feature | Description |
-|---------|-------------|
-| `device_change_and_large_amount_flag` | 1 if new OS type detected and amount > 1000 |
-| `session_first_tx_large_flag` | 1 if first transaction in session and amount > 1000 |
+### Производные признаки масштаба день+
 
-### Distance & entropy
+| Признак | Описание |
+|---------|----------|
+| `amount_rank_percentile_7d` | Позиция текущей суммы в диапазоне [min, max] за 7 дней (0-1) |
+| `amount_rank_percentile_30d` | Позиция текущей суммы в диапазоне [min, max] за 30 дней (0-1) |
+| `amount_rank_percentile_90d` | Позиция текущей суммы в диапазоне [min, max] за 90 дней (0-1) |
+| `amount_zscore_30d` | Z-score текущей суммы относительно среднего и std за 30 дней |
+| `amount_ratio_to_mean_30d` | Текущая сумма, делённая на среднюю за 30 дней |
+| `avg_tx_per_day_30d` | Среднее число транзакций в день за последние 30 дней |
+| `spend_velocity_1d` | Средние дневные траты из 30-дневного итога (`cumulative_spend_30d / 30`) |
+| `tx_count_ratio_7d_vs_90d` | Соотношение числа транзакций за 7 дней к числу за 90 дней |
+| `amount_mean_ratio_7d_vs_90d` | Соотношение средней суммы за 7 дней к средней за 30 дней |
+| `amount_diff_from_prev` | Разница между текущей и предыдущей суммой транзакции |
+| `amount_ratio_prev` | Отношение текущей суммы к предыдущей |
+| `burst_flag` | 1, если с предыдущей транзакции прошло менее 5 минут |
+| `spend_ratio_1d_vs_30d` | Доля 30-дневных трат, совершённых за последние сутки |
+| `spend_ratio_1d_vs_90d` | Доля 90-дневных трат, совершённых за последние сутки |
+| `spend_ratio_7d_vs_90d` | Доля 90-дневных трат, совершённых за последние 7 дней |
+| `spend_velocity_7d` | Средние дневные траты за последние 7 дней (`cumulative_spend_7d / 7`) |
+| `spend_velocity_30d` | Средние дневные траты за последние 30 дней (`cumulative_spend_30d / 30`) |
+| `amount_top5pct_30d` | 1, если сумма входит в топ 5% диапазона min-max за 30 дней |
+| `amount_top1pct_90d` | 1, если сумма входит в топ 1% диапазона min-max за 90 дней |
+| `amount_above_personal_max_flag` | 1, если сумма превышает личный максимум клиента за последние 90 дней |
 
-| Feature | Description |
-|---------|-------------|
-| `geo_jump_proxy` | Absolute timezone difference from the previous transaction (approximate geo-movement) |
-| `device_entropy_ratio` | Distinct OS types in last 30d divided by tx count in last 30d |
-| `language_mismatch` | 1 if `accept_language` != `browser_language` (null-safe version) |
-| `merchant_last_seen_days` | Days since the customer's previous transaction (any merchant); 999 if first |
-| `mcc_last_seen_days` | Days since the customer's previous transaction at this MCC; 999 if first |
+### Накопительная статистика по комбинациям (без утечки данных)
 
----
+| Признак | Описание |
+|---------|----------|
+| `spend_in_channel_lifetime` | Предыдущие накопленные траты для (клиент, channel_indicator_type) |
+| `tx_count_in_channel_lifetime` | Предыдущее накопленное число транзакций для (клиент, channel_indicator_type) |
+| `spend_in_channel_type_subtype_lifetime` | Предыдущие накопленные траты для (клиент, channel_type_subtype) |
+| `tx_count_in_channel_type_subtype_lifetime` | Предыдущее накопленное число транзакций для (клиент, channel_type_subtype) |
+| `spend_in_evtype_channel_lifetime` | Предыдущие накопленные траты для (клиент, evtype_channel) |
+| `tx_count_in_evtype_channel_lifetime` | Предыдущее накопленное число транзакций для (клиент, evtype_channel) |
+| `spend_in_evtype_subchannel_lifetime` | Предыдущие накопленные траты для (клиент, evtype_subchannel) |
+| `tx_count_in_evtype_subchannel_lifetime` | Предыдущее накопленное число транзакций для (клиент, evtype_subchannel) |
+| `spend_in_evtype_mcc_lifetime` | Предыдущие накопленные траты для (клиент, event_type_nm, mcc_code) |
+| `tx_count_in_evtype_mcc_lifetime` | Предыдущее накопленное число транзакций для (клиент, event_type_nm, mcc_code) |
 
-## Section H -- Per-Category Cumulative Stats (`category_stats.py`)
+### Доли использования
 
-Leakage-free per-user statistics for key categorical dimensions.
-Prior mean/std use `cum_sum().shift(1) / cum_count().shift(1)` to exclude the current row.
+| Признак | Описание |
+|---------|----------|
+| `channel_usage_share` | Доля транзакций за всё время в данном channel_indicator_type |
+| `channel_type_subtype_usage_share` | Доля транзакций за всё время в данном channel_type_subtype |
+| `evtype_channel_usage_share` | Доля транзакций за всё время в данном evtype_channel |
+| `evtype_subchannel_usage_share` | Доля транзакций за всё время в данном evtype_subchannel |
+| `evtype_mcc_usage_share` | Доля транзакций за всё время в данной паре (event_type_nm, mcc_code) |
 
-### Per-(customer, event_desc)
+### Доли трат: card vs P2P
 
-| Feature | Description |
-|---------|-------------|
-| `event_desc_spend_user` | Prior cumulative spend for this (customer, event_desc) pair |
-| `event_desc_amount_mean_user` | Prior mean amount for this event_desc |
-| `event_desc_amount_std_user` | Prior std of amount for this event_desc |
-| `event_desc_last_seen_days` | Days since last transaction with this event_desc; 999 if first |
-| `amount_zscore_given_event_desc` | Z-score of amount vs user's prior history for this event_desc |
-| `event_desc_spend_share_user` | Fraction of prior lifetime spend that went to this event_desc |
-| `event_desc_spend_vs_90d` | Lifetime event_desc spend / 90d cumulative spend |
+| Признак | Описание |
+|---------|----------|
+| `card_fraction_1d` | Card spend / суммарные траты за последние 1 д |
+| `p2p_fraction_1d` | P2P spend / суммарные траты за последние 1 д |
+| `card_fraction_7d` | Card spend / суммарные траты за последние 7 д |
+| `card_fraction_30d` | Card spend / суммарные траты за последние 30 д |
+| `p2p_fraction_30d` | P2P spend / суммарные траты за последние 30 д |
+| `card_fraction_90d` | Card spend / суммарные траты за последние 90 д |
+| `p2p_fraction_90d` | P2P spend / суммарные траты за последние 90 д |
 
-### Per-(customer, event_type_nm)
+### Кросс-оконные соотношения трат card / P2P
 
-| Feature | Description |
-|---------|-------------|
-| `event_type_spend_user` | Prior cumulative spend for this event_type |
-| `event_type_amount_mean_user` | Prior mean amount for this event_type |
-| `event_type_amount_std_user` | Prior std of amount for this event_type |
-| `event_type_last_seen_days` | Days since last transaction with this event_type; 999 if first |
-| `amount_zscore_given_event_type` | Z-score of amount vs user's prior for this event_type |
-| `event_type_spend_share_user` | Fraction of prior lifetime spend for this event_type |
-| `event_type_spend_vs_90d` | Lifetime event_type spend / 90d cumulative spend |
+| Признак | Описание |
+|---------|----------|
+| `card_spend_ratio_1d_vs_30d` | Card spend 1д / card spend 30д |
+| `p2p_spend_ratio_1d_vs_30d` | P2P spend 1д / P2P spend 30д |
+| `card_spend_ratio_1d_vs_90d` | Card spend 1д / card spend 90д |
+| `p2p_spend_ratio_1d_vs_90d` | P2P spend 1д / P2P spend 90д |
+| `card_spend_ratio_7d_vs_90d` | Card spend 7д / card spend 90д |
+| `p2p_spend_ratio_7d_vs_90d` | P2P spend 7д / P2P spend 90д |
 
-### Per-(customer, channel_indicator_sub_type)
+### Соотношения балансов card / P2P
 
-| Feature | Description |
-|---------|-------------|
-| `spend_in_subchannel_lifetime` | Prior cumulative spend for this subchannel |
-| `tx_count_in_subchannel_lifetime` | Prior cumulative tx count for this subchannel |
-| `amount_mean_subchannel_user` | Prior mean amount for this subchannel |
-| `amount_std_subchannel_user` | Prior std of amount for this subchannel |
-| `subchannel_last_seen_days` | Days since last transaction with this subchannel; 999 if first |
-| `subchannel_usage_share` | Fraction of lifetime transactions in this subchannel |
-| `channel_indicator_sub_type_log_count` | log1p of `tx_count_in_subchannel_lifetime` |
-| `is_new_subchannel_for_user` | 1 if this subchannel has never been seen for this customer |
-| `amount_zscore_given_subchannel` | Z-score of amount vs user's prior for this subchannel |
-| `subchannel_spend_vs_90d` | Lifetime subchannel spend / 90d cumulative spend |
-
-### Per-(customer, channel_type_subtype)
-
-| Feature | Description |
-|---------|-------------|
-| `amount_mean_channel_type_subtype_user` | Prior mean amount for this type+subtype combo |
-| `amount_std_channel_type_subtype_user` | Prior std of amount for this type+subtype combo |
-| `channel_type_subtype_last_seen_days` | Days since last transaction with this type+subtype; 999 if first |
-| `is_new_channel_type_subtype_for_user` | 1 if this type+subtype is new for this customer |
-| `amount_zscore_given_channel_type_subtype` | Z-score of amount vs prior for this type+subtype |
-| `channel_type_subtype_spend_vs_90d` | Lifetime type+subtype spend / 90d cumulative spend |
-
-### Per-(customer, evtype_channel)
-
-| Feature | Description |
-|---------|-------------|
-| `amount_mean_evtype_channel_user` | Prior mean amount for this evtype+channel combo |
-| `amount_std_evtype_channel_user` | Prior std of amount for this evtype+channel combo |
-| `evtype_channel_last_seen_days` | Days since last transaction with this evtype+channel; 999 if first |
-| `is_new_evtype_channel_for_user` | 1 if this evtype+channel is new for this customer |
-| `amount_zscore_given_evtype_channel` | Z-score of amount vs prior for this evtype+channel |
-| `evtype_channel_spend_vs_90d` | Lifetime evtype+channel spend / 90d cumulative spend |
-
-### Per-(customer, evtype_subchannel)
-
-| Feature | Description |
-|---------|-------------|
-| `amount_mean_evtype_subchannel_user` | Prior mean amount for this evtype+subchannel combo |
-| `amount_std_evtype_subchannel_user` | Prior std of amount for this evtype+subchannel combo |
-| `evtype_subchannel_last_seen_days` | Days since last with this evtype+subchannel; 999 if first |
-| `is_new_evtype_subchannel_for_user` | 1 if this evtype+subchannel is new for this customer |
-| `amount_zscore_given_evtype_subchannel` | Z-score of amount vs prior for this evtype+subchannel |
-| `evtype_subchannel_spend_vs_90d` | Lifetime evtype+subchannel spend / 90d cumulative spend |
-
-### Per-(customer, event_type_nm, mcc_code)
-
-| Feature | Description |
-|---------|-------------|
-| `amount_mean_evtype_mcc_user` | Prior mean amount for this evtype+MCC combo |
-| `amount_std_evtype_mcc_user` | Prior std of amount for this evtype+MCC combo |
-| `evtype_mcc_last_seen_days` | Days since last with this evtype+MCC; 999 if first |
-| `is_new_evtype_mcc_for_user` | 1 if this evtype+MCC is new for this customer |
-| `amount_zscore_given_evtype_mcc` | Z-score of amount vs prior for this evtype+MCC |
-| `evtype_mcc_spend_vs_90d` | Lifetime evtype+MCC spend / 90d cumulative spend |
-
-### Per-(customer, pos_cd)
-
-| Feature | Description |
-|---------|-------------|
-| `spend_in_pos_lifetime` | Prior cumulative spend for this POS code |
-| `amount_mean_pos_user` | Prior mean amount for this POS code |
-| `amount_std_pos_user` | Prior std of amount for this POS code |
-| `pos_last_seen_days` | Days since last transaction with this POS code; 999 if first |
-| `amount_zscore_given_pos` | Z-score of amount vs prior for this POS code |
-| `pos_spend_vs_90d` | Lifetime POS spend / 90d cumulative spend |
-
-### Per-(customer, tx_type_group)
-
-| Feature | Description |
-|---------|-------------|
-| `spend_in_tx_type_lifetime` | Prior cumulative spend for this tx_type_group |
-| `tx_count_in_tx_type_lifetime` | Prior cumulative tx count for this tx_type_group |
-| `amount_mean_tx_type_user` | Prior mean amount for this tx_type_group |
-| `amount_std_tx_type_user` | Prior std of amount for this tx_type_group |
-| `tx_type_usage_share` | Fraction of lifetime transactions in this tx_type_group |
-| `amount_zscore_given_tx_type` | Z-score of amount vs prior for this tx_type_group |
-| `tx_type_spend_share` | Fraction of prior lifetime spend for this tx_type_group |
-| `tx_type_spend_vs_90d` | Lifetime tx_type spend / 90d cumulative spend |
-
-### Cross-category novelty flags
-
-| Feature | Description |
-|---------|-------------|
-| `is_new_channel_desc_combo` | 1 if (channel_type, event_desc) combination is new for this customer |
-| `is_new_channel_type_combo` | 1 if (channel_type, event_type_nm) combination is new |
-| `is_new_subchannel_type_combo` | 1 if (subchannel, event_type_nm) combination is new |
-| `is_new_type_desc_combo` | 1 if (event_type_nm, event_desc) combination is new |
-| `is_new_txtype_channel_combo` | 1 if (tx_type_group, channel_type) combination is new |
-
-### Global (population-level) z-scores
-
-Available when `global_stats` is provided; otherwise constant 0.
-
-| Feature | Description |
-|---------|-------------|
-| `amount_zscore_event_desc_global` | Z-score of amount vs global population mean/std for this event_desc |
-| `amount_zscore_event_type_global` | Z-score of amount vs global mean/std for this event_type |
-| `amount_zscore_subchannel_global` | Z-score of amount vs global mean/std for this subchannel |
-| `amount_zscore_pos_global` | Z-score of amount vs global mean/std for this POS code |
-| `global_subchannel_freq` | Global frequency of this subchannel across training population |
-| `amount_zscore_channel_type_subtype_global` | Z-score of amount vs global mean/std for this channel_type_subtype |
-| `global_channel_type_subtype_freq` | Global frequency of this channel_type_subtype |
-| `amount_zscore_evtype_channel_global` | Z-score of amount vs global mean/std for this evtype_channel |
-| `global_evtype_channel_freq` | Global frequency of this evtype_channel |
-| `amount_zscore_evtype_subchannel_global` | Z-score of amount vs global mean/std for this evtype_subchannel |
-| `global_evtype_subchannel_freq` | Global frequency of this evtype_subchannel |
-| `amount_zscore_evtype_mcc_global` | Z-score of amount vs global mean/std for this (event_type, mcc_code) |
-| `global_evtype_mcc_freq` | Global frequency of this (event_type, mcc_code) |
+| Признак | Описание |
+|---------|----------|
+| `card_vs_p2p_ratio_1d` | Card spend 1д / P2P spend 1д |
+| `card_vs_p2p_ratio_30d` | Card spend 30д / P2P spend 30д |
+| `card_vs_p2p_ratio_90d` | Card spend 90д / P2P spend 90д |
 
 ---
 
-## Section I -- Bayesian Target Encodings (`category_stats.py`)
+## Секция E -- Риски устройства и сессии (`device.py`)
 
-Precomputed on the labeled training set via `compute_global_stats()`. Each feature is the Bayesian-smoothed fraud rate for that category value: `smoothed = (fraud_count + alpha * global_rate) / (labeled_count + alpha)`, alpha=20. Unseen values at test time are filled with the stored global fraud rate; 0.5 when no `global_stats` provided.
+### Флаги состояния устройства
 
-| Feature | Join key | Description |
-|---------|----------|-------------|
-| `event_type_nm_target_enc` | `event_type_nm` | Smoothed fraud rate per event type |
-| `event_desc_target_enc` | `event_desc` | Smoothed fraud rate per event description |
-| `channel_type_target_enc` | `channel_indicator_type` | Smoothed fraud rate per channel type |
-| `channel_subtype_target_enc` | `channel_indicator_sub_type` | Smoothed fraud rate per subchannel |
-| `mcc_target_enc` | `mcc_code` | Smoothed fraud rate per MCC; null (non-card) filled with global rate |
-| `channel_type_subtype_target_enc` | `channel_type_subtype` | Smoothed fraud rate per (type x subtype) |
-| `evtype_channel_target_enc` | `evtype_channel` | Smoothed fraud rate per (event_type x channel) |
-| `evtype_subchannel_target_enc` | `evtype_subchannel` | Smoothed fraud rate per (event_type x subchannel) |
-| `type_desc_pair_target_enc` | `(event_type_nm, event_desc)` | Pair-level fraud rate -- strongest single signal |
-| `channel_type_fraud_rate_within_group` | `(tx_type_group, channel_indicator_type)` | Channel fraud rate conditional on tx_type_group |
-| `channel_subtype_fraud_rate_within_group` | `(tx_type_group, channel_indicator_sub_type)` | Subtype fraud rate conditional on tx_type_group |
-| `evtype_mcc_target_enc` | `(event_type_nm, mcc_code)` | Per-(event_type x MCC) smoothed fraud rate |
+| Признак | Описание |
+|---------|----------|
+| `compromised_flag` | 1, если на устройстве есть root/jailbreak (`compromised = "true"`) |
+| `web_rdp_connection_flag` | 1, если устройство управляется удалённо (RDP) |
+| `developer_tools_flag` | 1, если на устройстве включены инструменты разработчика |
+| `phone_voip_call_flag` | 1, если во время транзакции был активен VoIP-звонок |
+| `low_battery_flag` | 1, если уровень заряда батареи устройства ниже 15% |
 
----
+### Флаги новизны устройства (впервые у данного клиента)
 
-## Section J -- Binary Risk Flags (`category_risk.py`)
+| Признак | Описание |
+|---------|----------|
+| `operating_system_is_new` | 1, если этот тип OS ни разу не встречался у данного клиента |
+| `os_version_is_new` | 1, если эта версия OS ни разу не встречалась у данного клиента |
+| `screen_size_is_new` | 1, если это разрешение экрана ни разу не встречалось у данного клиента |
+| `timezone_is_new` | 1, если этот часовой пояс ни разу не встречался у данного клиента |
+| `accept_language_is_new` | 1, если этот HTTP Accept-Language заголовок ни разу не встречался у данного клиента |
 
-Hardcoded from empirical fraud-rate analysis. No `global_stats` dependency.
+### Составные признаки устройства и сессии
 
-| Feature | Condition |
-|---------|-----------|
-| `is_very_high_risk_desc` | `event_desc` in {60, 41, 27, 73, 103} -- all >89% fraud |
-| `is_high_risk_desc` | `event_desc` in {68, 29, 31, 119, 113, 109, 37} -- all >67% fraud |
-| `is_low_risk_desc` | `event_desc` in {51, 5, 4, 69, 97, 32} -- all <20% fraud |
-| `is_high_risk_channel` | `channel_indicator_type == 6` OR `channel_indicator_sub_type == 11` |
-| `is_p2p_danger_channel` | `tx_type_group == 2` AND `channel_indicator_sub_type == 5` (90.5% fraud in P2P) |
-| `is_near_certain_fraud_pair` | `(event_type_nm, event_desc)` in {(14,60), (14,41), (14,73)} -- 93-100% fraud |
-
----
-
-## Feature count summary
-
-| Section | File | Features |
-|---------|------|----------|
-| A -- Transaction-level | `transaction.py` | 25 (incl. model_group routing key) |
-| B -- Behavioural & history | `behavioral.py` | 64 (6 counts + 8 derived + 21 lags + 9 running-max + 18 log-freq + 2 same-as-prev) |
-| K -- Label feedback | `feedback.py` | 20 |
-| D -- Rolling window base stats | `rolling.py` | 126 (14 metrics x 9 windows) |
-| D -- Rolling window derived | `rolling.py` | 60 (9 sub-day + 20 day+ + 10 lifetime + 5 usage + 7 card/p2p frac + 6 cross-window + 3 balance) |
-| E -- Device & session | `device.py` | 22 |
-| F -- Temporal & global freq | `temporal.py` | 23 |
-| G -- Z-scores & composite | `zscore.py` | 15 |
-| H -- Per-category stats | `category_stats.py` | 67 (7+7+10+6+6+6+6+6+8+5 cumulative) |
-| H -- Global z-scores | `category_stats.py` | 13 |
-| I -- Target encodings | `category_stats.py` | 12 |
-| J -- Binary risk flags | `category_risk.py` | 6 |
-| **Total** | | **~453** |
-
-*Minus 1 `model_group` (non-feature routing key) and 1 `amount_clean` (dropped intermediate) = ~451 usable feature columns.*
+| Признак | Описание |
+|---------|----------|
+| `device_risk_score` | Взвешенная сумма: `compromised x 5 + rdp x 3 + dev_tools x 2` |
+| `session_tx_count` | Число предыдущих транзакций в рамках текущей сессии |
+| `session_amount_sum` | Суммарные траты предыдущих транзакций в текущей сессии |
+| `session_channel_diversity` | 1, если тип канала отличается от предыдущей транзакции в этой сессии |
+| `session_length_estimate` | Псевдоним `session_tx_count` |
+| `session_mcc_switch` | 1, если MCC отличается от предыдущей транзакции в этой сессии |
+| `session_duration_minutes` | Минут с момента первой транзакции в текущей сессии |
+| `pause_ses` | Секунд с момента предыдущей транзакции в той же сессии |
+| `screen_w` | Ширина экрана в пикселях (извлечена из строки `screen_size` формата "WxH") |
+| `screen_h` | Высота экрана в пикселях (извлечена из строки `screen_size` формата "WxH") |
+| `session_avg_amount` | Средняя сумма на транзакцию за текущую сессию |
+| `rdp_x_session_depth` | `rdp_flag x session_tx_count` — глубина сессии при удалённом управлении |
 
 ---
 
-## Feature blacklist (zero-gain, excluded from model input)
+## Секция F -- Временные признаки и глобальные частоты (`temporal.py`)
 
-These features were removed from the code or blacklisted in `config.py` after showing zero split gain:
+### Глобальные частоты (уровень популяции, вычислены на тренировочных данных)
+
+| Признак | Описание |
+|---------|----------|
+| `global_mcc_freq` | Как часто этот MCC встречается среди всех тренировочных транзакций |
+| `global_channel_freq` | Как часто этот тип канала встречается среди всех тренировочных транзакций |
+| `global_device_os_freq` | Как часто этот тип OS встречается среди всех тренировочных транзакций |
+| `global_timezone_freq` | Как часто этот часовой пояс встречается среди всех тренировочных транзакций |
+| `global_language_freq` | Как часто этот Accept-Language заголовок встречается среди всех тренировочных транзакций |
+| `global_pos_cd_freq` | Как часто этот POS код встречается среди всех тренировочных транзакций |
+| `global_event_type_freq` | Как часто этот тип события встречается среди всех тренировочных транзакций |
+| `global_event_desc_freq` | Как часто это описание события встречается среди всех тренировочных транзакций |
+
+*Если `global_stats` не передан, каждый признак заменяется накопительным счётчиком по клиенту (fallback без утечки данных).*
+
+### Временные признаки и скорость транзакций
+
+| Признак | Описание |
+|---------|----------|
+| `circadian_deviation_score` | Абсолютное отклонение текущего часа от исторического среднего часа клиента |
+| `channel_shift_score` | 1, если тип канала отличается от предыдущей транзакции |
+| `velocity_change_flag` | 1, если сегодняшнее число транзакций превышает 2x среднедневное клиента за 30д |
+| `time_gap_variance_30d` | Std межтранзакционных интервалов по последним 90 транзакциям (скользящее) |
+| `time_gap_mean_30d` | Среднее межтранзакционных интервалов по последним 90 транзакциям (скользящее) |
+| `time_gap_min_10tx` | Минимальный межтранзакционный интервал среди последних 10 |
+| `time_gap_cv_30d` | Коэффициент вариации интервалов: `std / mean` (масштабонезависимая нерегулярность) |
+| `new_device_flag` | 1, если этот тип OS новый для клиента (псевдоним `operating_system_is_new`) |
+| `merchant_entropy_user` | Доля транзакций клиента в данном MCC (`mcc_freq_user_cum / tx_count_lifetime`) |
+| `browser_language_mismatch` | 1, если `accept_language` != `browser_language` |
+
+### Составные сигналы риска
+
+| Признак | Описание |
+|---------|----------|
+| `rdp_and_large_amount_flag` | 1, если активен RDP и сумма > 1000 |
+| `amount_zscore_given_channel` | Сумма относительно накопленного среднего клиента в данном канале |
+| `amount_zscore_given_mcc` | Сумма относительно накопленного среднего клиента в данном MCC |
+| `amount_zscore_given_device` | Сумма относительно накопленного среднего клиента на данном OS |
+| `tx_time_zscore_given_user` | Скользящее std часов транзакций клиента (временная нерегулярность) |
+
+---
+
+## Секция G -- Z-score и составные флаги (`zscore.py`)
+
+### Z-score суммы (глобальные базисы по каналу/MCC)
+
+| Признак | Описание |
+|---------|----------|
+| `amount_zscore_channel` | Z-score суммы относительно глобального среднего/std для данного канала |
+| `amount_zscore_mcc` | Z-score суммы относительно глобального среднего/std для данного MCC |
+
+### Комбинация и сессия
+
+| Признак | Описание |
+|---------|----------|
+| `global_combination_freq` | Частота комбинации (channel x OS) на уровне популяции |
+| `session_first_tx_flag` | 1, если это первая транзакция в сессии |
+
+### Флаги изменений (относительно предыдущей транзакции)
+
+| Признак | Описание |
+|---------|----------|
+| `language_change_flag` | 1, если `accept_language` отличается от предыдущей транзакции |
+| `os_change_flag` | 1, если тип OS отличается от предыдущей транзакции |
+| `timezone_change_flag` | 1, если часовой пояс отличается от предыдущей транзакции |
+| `rapid_sequence_flag` | 1, если с последней транзакции прошло менее 5 минут |
+
+### Составные флаги риска
+
+| Признак | Описание |
+|---------|----------|
+| `device_change_and_large_amount_flag` | 1, если обнаружен новый OS и сумма > 1000 |
+| `session_first_tx_large_flag` | 1, если первая транзакция в сессии и сумма > 1000 |
+
+### Расстояние и энтропия
+
+| Признак | Описание |
+|---------|----------|
+| `geo_jump_proxy` | Абсолютная разница часовых поясов с предыдущей транзакцией (приближённый геосдвиг) |
+| `device_entropy_ratio` | Уникальных типов OS за 30 дней, делённое на число транзакций за 30 дней |
+| `language_mismatch` | 1, если `accept_language` != `browser_language` (null-safe версия) |
+| `merchant_last_seen_days` | Дней с предыдущей транзакции клиента (любой); 999 если первая |
+| `mcc_last_seen_days` | Дней с предыдущей транзакции клиента в данном MCC; 999 если первая |
+
+---
+
+## Секция H -- Накопительная статистика по категориям (`category_stats.py`)
+
+Статистики по ключевым категориальным измерениям на уровне клиента, без утечки данных.
+Предшествующие mean/std используют `cum_sum().shift(1) / cum_count().shift(1)` для исключения текущей строки.
+
+### По (клиент, event_desc)
+
+| Признак | Описание |
+|---------|----------|
+| `event_desc_spend_user` | Предыдущие накопленные траты для пары (клиент, event_desc) |
+| `event_desc_amount_mean_user` | Предыдущее среднее суммы для данного event_desc |
+| `event_desc_amount_std_user` | Предыдущее std суммы для данного event_desc |
+| `event_desc_last_seen_days` | Дней с последней транзакции с данным event_desc; 999 если первая |
+| `amount_zscore_given_event_desc` | Z-score суммы относительно предыдущей истории клиента для данного event_desc |
+| `event_desc_spend_share_user` | Доля предыдущих трат за всё время, приходящихся на данный event_desc |
+| `event_desc_spend_vs_90d` | Накопленные траты по event_desc / траты за 90 дней |
+
+### По (клиент, event_type_nm)
+
+| Признак | Описание |
+|---------|----------|
+| `event_type_spend_user` | Предыдущие накопленные траты для данного event_type |
+| `event_type_amount_mean_user` | Предыдущее среднее суммы для данного event_type |
+| `event_type_amount_std_user` | Предыдущее std суммы для данного event_type |
+| `event_type_last_seen_days` | Дней с последней транзакции с данным event_type; 999 если первая |
+| `amount_zscore_given_event_type` | Z-score суммы относительно предыдущей истории клиента для данного event_type |
+| `event_type_spend_share_user` | Доля предыдущих трат за всё время для данного event_type |
+| `event_type_spend_vs_90d` | Накопленные траты по event_type / траты за 90 дней |
+
+### По (клиент, channel_indicator_sub_type)
+
+| Признак | Описание |
+|---------|----------|
+| `spend_in_subchannel_lifetime` | Предыдущие накопленные траты для данного subchannel |
+| `tx_count_in_subchannel_lifetime` | Предыдущее накопленное число транзакций для данного subchannel |
+| `amount_mean_subchannel_user` | Предыдущее среднее суммы для данного subchannel |
+| `amount_std_subchannel_user` | Предыдущее std суммы для данного subchannel |
+| `subchannel_last_seen_days` | Дней с последней транзакции с данным subchannel; 999 если первая |
+| `subchannel_usage_share` | Доля транзакций за всё время в данном subchannel |
+| `channel_indicator_sub_type_log_count` | log1p от `tx_count_in_subchannel_lifetime` |
+| `is_new_subchannel_for_user` | 1, если данный subchannel ни разу не встречался у клиента |
+| `amount_zscore_given_subchannel` | Z-score суммы относительно предыдущей истории клиента для данного subchannel |
+| `subchannel_spend_vs_90d` | Накопленные траты по subchannel / траты за 90 дней |
+
+### По (клиент, channel_type_subtype)
+
+| Признак | Описание |
+|---------|----------|
+| `amount_mean_channel_type_subtype_user` | Предыдущее среднее суммы для комбо type+subtype |
+| `amount_std_channel_type_subtype_user` | Предыдущее std суммы для комбо type+subtype |
+| `channel_type_subtype_last_seen_days` | Дней с последней транзакции с данным type+subtype; 999 если первая |
+| `is_new_channel_type_subtype_for_user` | 1, если данный type+subtype новый для клиента |
+| `amount_zscore_given_channel_type_subtype` | Z-score суммы относительно предыдущей истории для данного type+subtype |
+| `channel_type_subtype_spend_vs_90d` | Накопленные траты по type+subtype / траты за 90 дней |
+
+### По (клиент, evtype_channel)
+
+| Признак | Описание |
+|---------|----------|
+| `amount_mean_evtype_channel_user` | Предыдущее среднее суммы для комбо evtype+channel |
+| `amount_std_evtype_channel_user` | Предыдущее std суммы для комбо evtype+channel |
+| `evtype_channel_last_seen_days` | Дней с последней транзакции с данным evtype+channel; 999 если первая |
+| `is_new_evtype_channel_for_user` | 1, если данный evtype+channel новый для клиента |
+| `amount_zscore_given_evtype_channel` | Z-score суммы относительно предыдущей истории для данного evtype+channel |
+| `evtype_channel_spend_vs_90d` | Накопленные траты по evtype+channel / траты за 90 дней |
+
+### По (клиент, evtype_subchannel)
+
+| Признак | Описание |
+|---------|----------|
+| `amount_mean_evtype_subchannel_user` | Предыдущее среднее суммы для комбо evtype+subchannel |
+| `amount_std_evtype_subchannel_user` | Предыдущее std суммы для комбо evtype+subchannel |
+| `evtype_subchannel_last_seen_days` | Дней с последней транзакции с данным evtype+subchannel; 999 если первая |
+| `is_new_evtype_subchannel_for_user` | 1, если данный evtype+subchannel новый для клиента |
+| `amount_zscore_given_evtype_subchannel` | Z-score суммы относительно предыдущей истории для данного evtype+subchannel |
+| `evtype_subchannel_spend_vs_90d` | Накопленные траты по evtype+subchannel / траты за 90 дней |
+
+### По (клиент, event_type_nm, mcc_code)
+
+| Признак | Описание |
+|---------|----------|
+| `amount_mean_evtype_mcc_user` | Предыдущее среднее суммы для комбо evtype+MCC |
+| `amount_std_evtype_mcc_user` | Предыдущее std суммы для комбо evtype+MCC |
+| `evtype_mcc_last_seen_days` | Дней с последней транзакции с данным evtype+MCC; 999 если первая |
+| `is_new_evtype_mcc_for_user` | 1, если данный evtype+MCC новый для клиента |
+| `amount_zscore_given_evtype_mcc` | Z-score суммы относительно предыдущей истории для данного evtype+MCC |
+| `evtype_mcc_spend_vs_90d` | Накопленные траты по evtype+MCC / траты за 90 дней |
+
+### По (клиент, pos_cd)
+
+| Признак | Описание |
+|---------|----------|
+| `spend_in_pos_lifetime` | Предыдущие накопленные траты для данного POS кода |
+| `amount_mean_pos_user` | Предыдущее среднее суммы для данного POS кода |
+| `amount_std_pos_user` | Предыдущее std суммы для данного POS кода |
+| `pos_last_seen_days` | Дней с последней транзакции с данным POS кодом; 999 если первая |
+| `amount_zscore_given_pos` | Z-score суммы относительно предыдущей истории для данного POS кода |
+| `pos_spend_vs_90d` | Накопленные траты по POS / траты за 90 дней |
+
+### По (клиент, tx_type_group)
+
+| Признак | Описание |
+|---------|----------|
+| `spend_in_tx_type_lifetime` | Предыдущие накопленные траты для данного tx_type_group |
+| `tx_count_in_tx_type_lifetime` | Предыдущее накопленное число транзакций для данного tx_type_group |
+| `amount_mean_tx_type_user` | Предыдущее среднее суммы для данного tx_type_group |
+| `amount_std_tx_type_user` | Предыдущее std суммы для данного tx_type_group |
+| `tx_type_usage_share` | Доля транзакций за всё время в данном tx_type_group |
+| `amount_zscore_given_tx_type` | Z-score суммы относительно предыдущей истории для данного tx_type_group |
+| `tx_type_spend_share` | Доля предыдущих трат за всё время для данного tx_type_group |
+| `tx_type_spend_vs_90d` | Накопленные траты по tx_type / траты за 90 дней |
+
+### Флаги новизны кросс-категориальных комбинаций
+
+| Признак | Описание |
+|---------|----------|
+| `is_new_channel_desc_combo` | 1, если комбинация (channel_type, event_desc) новая для данного клиента |
+| `is_new_channel_type_combo` | 1, если комбинация (channel_type, event_type_nm) новая |
+| `is_new_subchannel_type_combo` | 1, если комбинация (subchannel, event_type_nm) новая |
+| `is_new_type_desc_combo` | 1, если комбинация (event_type_nm, event_desc) новая |
+| `is_new_txtype_channel_combo` | 1, если комбинация (tx_type_group, channel_type) новая |
+
+### Глобальные z-score (уровень популяции)
+
+Доступны при наличии `global_stats`; иначе константа 0.
+
+| Признак | Описание |
+|---------|----------|
+| `amount_zscore_event_desc_global` | Z-score суммы относительно глобального среднего/std для данного event_desc |
+| `amount_zscore_event_type_global` | Z-score суммы относительно глобального среднего/std для данного event_type |
+| `amount_zscore_subchannel_global` | Z-score суммы относительно глобального среднего/std для данного subchannel |
+| `amount_zscore_pos_global` | Z-score суммы относительно глобального среднего/std для данного POS кода |
+| `global_subchannel_freq` | Глобальная частота данного subchannel в тренировочной популяции |
+| `amount_zscore_channel_type_subtype_global` | Z-score суммы относительно глобального среднего/std для данного channel_type_subtype |
+| `global_channel_type_subtype_freq` | Глобальная частота данного channel_type_subtype |
+| `amount_zscore_evtype_channel_global` | Z-score суммы относительно глобального среднего/std для данного evtype_channel |
+| `global_evtype_channel_freq` | Глобальная частота данного evtype_channel |
+| `amount_zscore_evtype_subchannel_global` | Z-score суммы относительно глобального среднего/std для данного evtype_subchannel |
+| `global_evtype_subchannel_freq` | Глобальная частота данного evtype_subchannel |
+| `amount_zscore_evtype_mcc_global` | Z-score суммы относительно глобального среднего/std для пары (event_type, mcc_code) |
+| `global_evtype_mcc_freq` | Глобальная частота пары (event_type, mcc_code) |
+
+---
+
+## Секция I -- Байесовские target-энкодинги (`category_stats.py`)
+
+Вычислены на размеченной тренировочной выборке через `compute_global_stats()`. Каждый признак — сглаженная Байесовским методом частота мошенничества для значения категории: `smoothed = (fraud_count + alpha * global_rate) / (labeled_count + alpha)`, alpha=20. Новые значения в тесте заполняются сохранённой глобальной частотой мошенничества; 0.5 при отсутствии `global_stats`.
+
+| Признак | Ключ соединения | Описание |
+|---------|-----------------|----------|
+| `event_type_nm_target_enc` | `event_type_nm` | Сглаженная частота мошенничества по типу события |
+| `event_desc_target_enc` | `event_desc` | Сглаженная частота мошенничества по описанию события |
+| `channel_type_target_enc` | `channel_indicator_type` | Сглаженная частота мошенничества по типу канала |
+| `channel_subtype_target_enc` | `channel_indicator_sub_type` | Сглаженная частота мошенничества по subchannel |
+| `mcc_target_enc` | `mcc_code` | Сглаженная частота мошенничества по MCC; null (non-card) заполняется глобальной частотой |
+| `channel_type_subtype_target_enc` | `channel_type_subtype` | Сглаженная частота мошенничества по (type x subtype) |
+| `evtype_channel_target_enc` | `evtype_channel` | Сглаженная частота мошенничества по (event_type x channel) |
+| `evtype_subchannel_target_enc` | `evtype_subchannel` | Сглаженная частота мошенничества по (event_type x subchannel) |
+| `type_desc_pair_target_enc` | `(event_type_nm, event_desc)` | Частота мошенничества на уровне пары — сильнейший одиночный сигнал |
+| `channel_type_fraud_rate_within_group` | `(tx_type_group, channel_indicator_type)` | Частота мошенничества по каналу при условии tx_type_group |
+| `channel_subtype_fraud_rate_within_group` | `(tx_type_group, channel_indicator_sub_type)` | Частота мошенничества по subchannel при условии tx_type_group |
+| `evtype_mcc_target_enc` | `(event_type_nm, mcc_code)` | Сглаженная частота мошенничества по (event_type x MCC) |
+
+---
+
+## Секция J -- Бинарные флаги риска (`category_risk.py`)
+
+Жёстко заданы по результатам эмпирического анализа частот мошенничества. Не зависят от `global_stats`.
+
+| Признак | Условие |
+|---------|---------|
+| `is_very_high_risk_desc` | `event_desc` входит в {60, 41, 27, 73, 103} — все >89% мошенничества |
+| `is_high_risk_desc` | `event_desc` входит в {68, 29, 31, 119, 113, 109, 37} — все >67% мошенничества |
+| `is_low_risk_desc` | `event_desc` входит в {51, 5, 4, 69, 97, 32} — все <20% мошенничества |
+| `is_high_risk_channel` | `channel_indicator_type == 6` ИЛИ `channel_indicator_sub_type == 11` |
+| `is_p2p_danger_channel` | `tx_type_group == 2` И `channel_indicator_sub_type == 5` (90.5% мошенничества в P2P) |
+| `is_near_certain_fraud_pair` | `(event_type_nm, event_desc)` входит в {(14,60), (14,41), (14,73)} — 93-100% мошенничества |
+
+---
+
+## Сводка по количеству признаков
+
+| Секция | Файл | Признаков |
+|--------|------|-----------|
+| A -- Уровень транзакции | `transaction.py` | 25 (вкл. ключ маршрутизации model_group) |
+| B -- Поведение и история | `behavioral.py` | 64 (6 счётчиков + 8 производных + 21 лаговый + 9 running-max + 18 log-частот + 2 совпадения) |
+| K -- Обратная связь по меткам | `feedback.py` | 20 |
+| D -- Базовые rolling-статистики | `rolling.py` | 126 (14 метрик x 9 окон) |
+| D -- Производные rolling | `rolling.py` | 60 (9 субдневных + 20 день+ + 10 накопленных + 5 долей + 7 card/p2p + 6 кросс-оконных + 3 балансовых) |
+| E -- Устройство и сессия | `device.py` | 22 |
+| F -- Временные и глобальные частоты | `temporal.py` | 23 |
+| G -- Z-score и составные | `zscore.py` | 15 |
+| H -- Статистики по категориям | `category_stats.py` | 67 (7+7+10+6+6+6+6+6+8+5 накопленных) |
+| H -- Глобальные z-score | `category_stats.py` | 13 |
+| I -- Target-энкодинги | `category_stats.py` | 12 |
+| J -- Бинарные флаги риска | `category_risk.py` | 6 |
+| **Итого** | | **~453** |
+
+*Минус 1 `model_group` (ключ маршрутизации, не признак) и 1 `amount_clean` (промежуточная, удаляется) = ~451 используемых колонок признаков.*
+
+---
+
+## Чёрный список признаков (нулевой gain, исключены из входа модели)
+
+Эти признаки были удалены из кода или внесены в чёрный список в `config.py` после того, как показали нулевой split gain:
 
 `compromised_and_high_amount_flag`, `timezone_mismatch`, `burst_flag_15m`, `voip_and_new_mcc_flag`, `suspicious_env_flag`, `mcc_rare_global_flag`, `rare_combination_flag`, `compromised_x_amount_ratio`, `pos_cd_is_new`, `mcc_is_new_for_user`, `amount_usd_normalized`, `amount_missing_flag`, `new_device_and_night_flag`, `new_mcc_flag`, `new_channel_flag`.
 
-Note: `compromised_flag` and `developer_tools_flag` are still produced by `device.py` but are in the blacklist. All other blacklisted features have been removed from the pipeline entirely.
+Примечание: `compromised_flag` и `developer_tools_flag` по-прежнему производятся в `device.py`, но находятся в чёрном списке. Все остальные признаки из чёрного списка полностью удалены из пайплайна.
