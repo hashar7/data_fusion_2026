@@ -877,7 +877,7 @@ def train_v2(gpu: bool = False) -> None:
 
     susp_model_val, susp_best_iter, _ = train_suspicious(
         train_df        = hier_train_df,
-        val_labeled_df  = labeled_val_df,
+        val_df          = val_df,
         all_features    = hier_all_features,
         cat_features    = hier_cat_features,
         params          = susp_params,
@@ -1188,6 +1188,9 @@ def train_v2(gpu: bool = False) -> None:
         verbose           = True,
     )
     print(f"  Hier full data shape : {hier_full_df.shape}", flush=True)
+
+    # Defragment before adding derived columns (avoids PerformanceWarning)
+    hier_full_df = hier_full_df.copy()
 
     avail_hier = [c for c in hier_all_features if c in hier_full_df.columns]
     cat_idx    = [avail_hier.index(c) for c in hier_cat_features if c in avail_hier]

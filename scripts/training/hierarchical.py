@@ -240,7 +240,7 @@ def _build_pool(
 
 def train_suspicious(
     train_df: pd.DataFrame,
-    val_labeled_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     all_features: list,
     cat_features: list,
     params: dict,
@@ -252,10 +252,11 @@ def train_suspicious(
     """
     Train the suspicious detector: (red | yellow) vs green.
 
-    Target = 1 for labeled rows (raw_target != -1), 0 for sampled green rows.
-    Validation uses labeled-only val rows evaluated on is_labeled target.
+    Target = 1 for labeled rows (raw_target != -1), 0 for unlabeled green rows.
+    val_df must include BOTH labeled and unlabeled rows so the AUC eval metric
+    has both positive and negative examples.
 
-    Returns (model, best_iteration, val_pr_auc)
+    Returns (model, best_iteration, val_auc)
     """
     print(f"\nTraining Suspicious Detector (P(labeled | tx)) …", flush=True)
 
@@ -281,13 +282,26 @@ def train_suspicious(
         cat_features=cat_idx,
     )
 
-    # Val pool: all labeled val rows, is_labeled = 1 target
-    val_df = val_labeled_df.copy()
-    val_df["__susp_target"] = 1  # all val rows here are labeled
+    # Val pool: labeled → target=1, unlabeled → target=0
+    val_copy = val_df.copy()
+    if "_is_labeled" in val_copy.columns:
+        val_copy["__susp_target"] = val_copy["_is_labeled"].astype(np.int8)
+    elif "raw_target" in val_copy.columns:
+        val_copy["__susp_target"] = (val_copy["raw_target"] != -1).astype(np.int8)
+    else:
+        val_copy["__susp_target"] = 1
+
+    n_val_pos = int(val_copy["__susp_target"].sum())
+    n_val_neg = len(val_copy) - n_val_pos
+    print(f"  Val rows: {len(val_copy):,}  ({n_val_pos:,} labeled, {n_val_neg:,} unlabeled)",
+          flush=True)
+
+    avail_val = [c for c in avail_feats if c in val_copy.columns]
+    cat_idx_val = [avail_val.index(c) for c in cat_features if c in avail_val]
     val_pool = Pool(
-        val_df[[c for c in avail_feats if c in val_df.columns]],
-        label=val_df["__susp_target"].values,
-        cat_features=[avail_feats.index(c) for c in cat_features if c in avail_feats and c in val_df.columns],
+        val_copy[avail_val],
+        label=val_copy["__susp_target"].values,
+        cat_features=cat_idx_val,
     )
 
     # Fit
@@ -303,19 +317,17 @@ def train_suspicious(
 
     best_iter = model.get_best_iteration() or _params.get("iterations", 1000)
 
-    # PR-AUC on labeled val (all labeled rows have raw_target in {0,1})
+    # AUC on the full val set (labeled=1 vs unlabeled=0)
     val_raw = model.predict(val_pool, prediction_type="RawFormulaVal")
-    y_val_labeled = val_labeled_df["raw_target"].values.astype(np.int8)
-    # val_labeled_df contains only labeled rows, so raw_target ∈ {0,1}
-    val_prauc = average_precision_score(y_val_labeled, val_raw)
+    val_auc = average_precision_score(val_copy["__susp_target"].values, val_raw)
     print(f"\n  Suspicious | training time : {_fmt(time.perf_counter() - t0)}")
     print(f"  Suspicious | best_iter     : {best_iter}")
-    print(f"  Suspicious | val PR-AUC (red vs others in labeled): {val_prauc:.6f}\n",
+    print(f"  Suspicious | val PR-AUC (labeled vs unlabeled): {val_auc:.6f}\n",
           flush=True)
 
-    del train_df, val_df, train_pool, val_pool
+    del train_df, val_copy, train_pool, val_pool
     gc.collect()
-    return model, best_iter, val_prauc
+    return model, best_iter, val_auc
 
 
 def train_rgs(

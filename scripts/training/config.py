@@ -85,6 +85,9 @@ LGBM_PARAMS_BY_GROUP = {
         "min_child_samples": 50,
         "num_leaves":        63,
     },
+    3: {  # p2p — didn't early-stop at 5000; still improving at iteration 4971
+        "n_estimators":  8000,
+    },
 }
 
 # Per-group early-stopping patience overrides.
@@ -170,13 +173,15 @@ YELLOW_WEIGHT_MULTIPLIER = 2.0
 #   (2) Red|Suspicious model : red vs yellow, labeled only — P(fraud | labeled, tx)
 # Final product: sigmoid(susp_raw) × sigmoid(rgs_raw)  ≈ P(fraud | tx)
 #
-# These models use a curated ~50-feature set plus customer_id as a high-cardinality
-# categorical feature (CatBoost handles this natively via ordered target statistics).
+# These models use a curated ~50-feature set with native CatBoost categorical handling.
+# customer_id was removed: 100K unique values caused 10+ GB model files and 3+ h
+# training time on CPU.  Per-customer signal is captured by label-feedback features
+# (fb_cust_prev_red_cnt, fb_sec_since_prev_red, etc.) which are already in the
+# numerical feature set.
 
 # Categorical features for hierarchical CatBoost — int-encoded in the parquet plus
-# customer_id (Int64) and mcc_code_int (derived from mcc_code String at load time).
+# mcc_code_int (derived from mcc_code String at load time).
 HIERARCHICAL_CAT_FEATURES = [
-    "customer_id",                  # 100K unique — CatBoost handles via ordered stats
     "event_type_nm",
     "event_desc",
     "channel_indicator_type",
