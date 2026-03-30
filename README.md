@@ -1,6 +1,6 @@
 # Data Fusion 2026 — Guardian Track
 
-Solution to the [Data Fusion 2026](https://fusioncontest.ru/) hackathon, Guardian track.
+Solution to the [Data Fusion 2026](https://ods.ai/competitions/data-fusion2026-guardian) hackathon, Guardian track.
 
 **Task:** classify unconfirmed bank transactions as fraud or legitimate.
 **Metric:** PR-AUC (`sklearn.metrics.average_precision_score`).
