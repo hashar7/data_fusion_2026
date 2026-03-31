@@ -8,14 +8,15 @@ All logic lives in scripts/training/:
   predict.py  — score_test (submission CSV)
   pipeline.py — train_baseline (orchestrator)
 """
-from scripts.training.pipeline import train_baseline, train_rf_fg_by_group, train_catboost_fu, train_final_ensemble  # noqa: F401 (re-exported)
+from scripts.training.pipeline import train_baseline, train_rf_fg_by_group, train_catboost_fu_by_group, train_final_ensemble_by_group  # noqa: F401 (re-exported)
 from scripts.training import (                         # noqa: F401
     train_model, 
     evaluate, 
-    score_test, score_test_final_ensemble,
+    score_test, score_test_final_ensemble_by_group,
     load_labels, build_memmaps,
     build_labeled_train_indices, 
     train_rf_model, sanitize_rf_features,
     LGBM_PARAMS, NON_FEATURE_COLS,
-    RF_BASE_PARAMS, RF_CV_SEED
+    RF_BASE_PARAMS, RF_CV_SEED,
+    CATBOOST_FU_MODEL_PATH_FMT, 
 )

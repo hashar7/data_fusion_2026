@@ -10,7 +10,7 @@ import polars as pl
 import lightgbm as lgb
 from catboost import CatBoostClassifier
 
-from scripts.training.config import CATBOOST_FU_MODEL_FILENAME, RF_MODEL_FILENAME, TX_TYPE_GROUPS, LGBM_MODEL_PATH_FMT
+from scripts.training.config import CATBOOST_FU_MODEL_PATH_FMT, RF_MODEL_PATH_FMT, TX_TYPE_GROUPS, LGBM_MODEL_PATH_FMT
 from scripts.training.config import NON_FEATURE_COLS
 
 
@@ -105,8 +105,8 @@ def _get_feature_cols(df: pl.DataFrame) -> list:
             if c not in NON_FEATURE_COLS and df[c].dtype in numeric]
 
 
-def _load_tx_type_catboost_models(models_dir: str) -> dict[int, CatBoostClassifier]:
-    model_files = {
+def _load_group_tx_catboost_models(models_dir: str) -> dict[int, CatBoostClassifier]:
+    filenames = {
         0: "model_np_type7_catboost.cbm",
         1: "model_np_other_catboost.cbm",
         2: "model_card_catboost.cbm",
@@ -114,28 +114,20 @@ def _load_tx_type_catboost_models(models_dir: str) -> dict[int, CatBoostClassifi
     }
 
     models: dict[int, CatBoostClassifier] = {}
-    for group_id, filename in model_files.items():
+    for group_id, filename in filenames.items():
         path = os.path.join(models_dir, filename)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing tx_type_group CatBoost model: {path}")
+            raise FileNotFoundError(f"Missing tx CatBoost model: {path}")
         model = CatBoostClassifier()
         model.load_model(path)
         models[group_id] = model
-        print(f"Loaded tx_type_group CatBoost model → {path}", flush=True)
+        print(f"Loaded tx CatBoost model → {path}", flush=True)
 
     print()
     return models
 
 
-def _load_tx_type_lgbm_models(models_dir: str) -> dict[int, list[lgb.Booster]]:
-    """
-    Load pre-trained tx_type_group LightGBM models for all available seeds.
-
-    Expected names come from LGBM_MODEL_PATH_FMT, e.g.:
-        model_card_lgbm_seed0.txt
-        model_np_other_lgbm_seed1.txt
-        ...
-    """
+def _load_group_tx_lgbm_models(models_dir: str) -> dict[int, list[lgb.Booster]]:
     boosters_by_group: dict[int, list[lgb.Booster]] = {}
 
     for group_id, group_name in TX_TYPE_GROUPS.items():
@@ -146,38 +138,48 @@ def _load_tx_type_lgbm_models(models_dir: str) -> dict[int, list[lgb.Booster]]:
         paths = sorted(glob.glob(pattern))
         if not paths:
             raise FileNotFoundError(
-                f"No tx_type_group LightGBM models found for group {group_id} "
-                f"({group_name}) using pattern {pattern!r}"
+                f"No LightGBM tx models found for group {group_id} ({group_name}) "
+                f"using pattern {pattern!r}"
             )
 
-        boosters: list[lgb.Booster] = []
+        boosters = [lgb.Booster(model_file=path) for path in paths]
         for path in paths:
-            boosters.append(lgb.Booster(model_file=path))
-            print(f"Loaded tx_type_group LightGBM model → {path}", flush=True)
-
+            print(f"Loaded tx LightGBM model → {path}", flush=True)
         boosters_by_group[group_id] = boosters
 
     print()
     return boosters_by_group
 
 
-def _load_rf_bundle(models_dir: str) -> dict:
-    path = os.path.join(models_dir, RF_MODEL_FILENAME)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing RF model bundle: {path}")
-    bundle = joblib.load(path)
-    print(f"Loaded RF bundle → {path}", flush=True)
-    return bundle
+def _load_group_rf_bundles(models_dir: str) -> dict[int, dict]:
+    bundles: dict[int, dict] = {}
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        path = os.path.join(models_dir, RF_MODEL_PATH_FMT.format(name=group_name))
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing RF bundle for group {group_id}: {path}")
+        bundles[group_id] = joblib.load(path)
+        print(f"Loaded RF bundle → {path}", flush=True)
+    print()
+    return bundles
 
 
-def _load_fu_catboost_model(models_dir: str) -> CatBoostClassifier:
-    path = os.path.join(models_dir, CATBOOST_FU_MODEL_FILENAME)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing F/U CatBoost model: {path}")
-    model = CatBoostClassifier()
-    model.load_model(path)
-    print(f"Loaded F/U CatBoost model → {path}", flush=True)
-    return model
+def _load_group_fu_catboost_models(models_dir: str) -> dict[int, CatBoostClassifier]:
+    models: dict[int, CatBoostClassifier] = {}
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        path = os.path.join(models_dir, CATBOOST_FU_MODEL_PATH_FMT.format(name=group_name))
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing F/U CatBoost model for group {group_id}: {path}")
+        model = CatBoostClassifier()
+        model.load_model(path)
+        models[group_id] = model
+        print(f"Loaded F/U CatBoost model → {path}", flush=True)
+    print()
+    return models
+
+
+def _submission_with_suffix(base_path: str, suffix: str) -> str:
+    base, ext = os.path.splitext(base_path)
+    return f"{base}_{suffix}{ext}"
 
 
 # ── System helpers ─────────────────────────────────────────────────────–––––––––––––––––––––

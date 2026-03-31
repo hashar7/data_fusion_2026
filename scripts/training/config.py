@@ -151,9 +151,10 @@ CATBOOST_FU_MODEL_PATH_FMT = "model_{name}_catboost_fu.cbm"
 
 
 # ── Final ensemble ────────────────────────────────────────────────–––––––––––––
-FINAL_ENSEMBLE_MODEL_FILENAME = "model_final_ensemble_catboost.cbm"
+FINAL_ENSEMBLE_MODEL_PATH_FMT = "model_{name}_final_ensemble_catboost.cbm"
 
 
 # ── tmp paths ────────────────────────────────────────────────–––––––––––––
 RF_MODEL_FILENAME = '.'
 CATBOOST_FU_MODEL_FILENAME = "model_catboost_fu.cbm"
+FINAL_ENSEMBLE_MODEL_FILENAME = "model_final_ensemble_catboost.cbm"

@@ -18,51 +18,29 @@ from scripts.training.train_rf import sanitize_rf_features
 # from scripts.training.pipeline import _score_tx_group_ensemble_chunk
 
 
-def _score_tx_group_ensemble_chunk(
-    X_chunk: np.ndarray,
-    model_group_chunk: np.ndarray,
-    lgbm_boosters: dict[int, list[lgb.Booster]],
-    catboost_models: dict[int, CatBoostClassifier],
-    blend_weight: float = CATBOOST_BLEND_WEIGHT,
+def _score_tx_group_ensemble_single_group(
+    X_group: np.ndarray,
+    group_id: int,
+    tx_lgbm_models: dict[int, list[lgb.Booster]],
+    tx_cb_models: dict[int, CatBoostClassifier],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Score one chunk with the historical tx_type_group ensemble:
-        1. average LightGBM scores across seeds for the row's model_group
-        2. score CatBoost for the same group
-        3. blend exactly as in train_baseline / score_test
-    """
-    lgbm_scores = np.empty(len(X_chunk), dtype=np.float32)
-    cb_scores = np.empty(len(X_chunk), dtype=np.float32)
-    blend_scores = np.empty(len(X_chunk), dtype=np.float32)
+    boosters = tx_lgbm_models[group_id]
+    cb_model = tx_cb_models[group_id]
 
-    for group_id in TX_TYPE_GROUPS:
-        group_mask = model_group_chunk == group_id
-        if not group_mask.any():
-            continue
+    lgbm_sum = np.zeros(len(X_group), dtype=np.float64)
+    for booster in boosters:
+        lgbm_sum += booster.predict(
+            X_group,
+            num_iteration=booster.best_iteration,
+        ).astype(np.float64)
+    lgbm_avg = (lgbm_sum / len(boosters)).astype(np.float32)
 
-        X_g = X_chunk[group_mask]
-        boosters = lgbm_boosters[group_id]
-        cb_model = catboost_models[group_id]
+    cb_scores = cb_model.predict_proba(X_group)[:, 1].astype(np.float32)
+    blend_scores = (
+        lgbm_avg * (1.0 - CATBOOST_BLEND_WEIGHT) + cb_scores * CATBOOST_BLEND_WEIGHT
+    ).astype(np.float32)
 
-        lgbm_sum = np.zeros(len(X_g), dtype=np.float64)
-        for booster in boosters:
-            lgbm_sum += booster.predict(
-                X_g,
-                num_iteration=booster.best_iteration,
-            ).astype(np.float64)
-        lgbm_avg = (lgbm_sum / len(boosters)).astype(np.float32)
-
-        cb_s = cb_model.predict_proba(X_g)[:, 1].astype(np.float32)
-        blended = (lgbm_avg * (1.0 - blend_weight) + cb_s * blend_weight).astype(np.float32)
-
-        lgbm_scores[group_mask] = lgbm_avg
-        cb_scores[group_mask] = cb_s
-        blend_scores[group_mask] = blended
-
-        del X_g, lgbm_sum, lgbm_avg, cb_s, blended
-        gc.collect()
-
-    return lgbm_scores, cb_scores, blend_scores
+    return lgbm_avg, cb_scores, blend_scores
 
 
 def score_test(
@@ -222,18 +200,17 @@ def score_test(
         print(f"    {lbl:6s}: {float(np.percentile(scores_all, pct)):.6f}")
 
 
-def score_test_final_ensemble(
-    final_model: CatBoostClassifier,
+def score_test_final_ensemble_by_group(
+    final_models: dict[int, CatBoostClassifier],
     tx_lgbm_models: dict[int, list[lgb.Booster]],
     tx_cb_models: dict[int, CatBoostClassifier],
-    rf_bundle: dict,
-    fu_cb_model: CatBoostClassifier,
+    rf_bundles: dict[int, dict],
+    fu_cb_models: dict[int, CatBoostClassifier],
     feature_cols: list[str],
     submission_path: str,
 ) -> None:
     """
-    Score test rows using the final ensemble and write submission with the same
-    schema/location pattern as train_baseline.
+    Score test rows using per-group final ensemble models and write submission CSV.
     """
     test_files = _parquet_files(FEATURES_DIR)
     if not test_files:
@@ -244,8 +221,9 @@ def score_test_final_ensemble(
     all_scores: list[np.ndarray] = []
     wall_times: list[float] = []
     total_test_rows = 0
+    group_counts = {g: 0 for g in TX_TYPE_GROUPS}
 
-    print(f"\nScoring test set with final ensemble from {FEATURES_DIR!r} …", flush=True)
+    print(f"\nScoring test set with final per-group ensemble from {FEATURES_DIR!r} …", flush=True)
     print(f"  CatBoost tx blend weight : {CATBOOST_BLEND_WEIGHT}\n", flush=True)
 
     for i, f in enumerate(test_files):
@@ -272,53 +250,63 @@ def score_test_final_ensemble(
         event_ids = test_chunk["event_id"].to_numpy()
         model_group_chunk = test_chunk["model_group"].to_numpy().astype(np.int8)
         X_chunk = test_chunk.select(feature_cols).to_numpy(allow_copy=True).astype(np.float32)
+        scores_chunk = np.zeros(len(test_chunk), dtype=np.float32)
 
-        tx_lgbm_scores, tx_cb_scores, tx_blend_scores = _score_tx_group_ensemble_chunk(
-            X_chunk,
-            model_group_chunk,
-            tx_lgbm_models,
-            tx_cb_models,
-            blend_weight=CATBOOST_BLEND_WEIGHT,
-        )
+        for group_id, final_model in final_models.items():
+            group_mask = model_group_chunk == group_id
+            if not group_mask.any():
+                continue
 
-        X_rf = sanitize_rf_features(
-            X_chunk,
-            feature_cols=rf_bundle["feature_cols"],
-            stage=f"test chunk {i} rf",
-        )
-        rf_scores = rf_bundle["model"].predict_proba(X_rf)[:, 1].astype(np.float32)
-        fu_scores = fu_cb_model.predict_proba(X_chunk)[:, 1].astype(np.float32)
+            group_local_idx = np.flatnonzero(group_mask)
+            X_group = X_chunk[group_local_idx]
 
-        X_meta = np.column_stack(
-            [
+            tx_lgbm_scores, tx_cb_scores, tx_blend_scores = _score_tx_group_ensemble_single_group(
+                X_group,
+                group_id,
+                tx_lgbm_models,
+                tx_cb_models,
+            )
+
+            rf_bundle = rf_bundles[group_id]
+            X_rf = sanitize_rf_features(
+                X_group,
+                feature_cols=rf_bundle["feature_cols"],
+                stage=f"test rf group={group_id}",
+            )
+            rf_scores = rf_bundle["model"].predict_proba(X_rf)[:, 1].astype(np.float32)
+            fu_scores = fu_cb_models[group_id].predict_proba(X_group)[:, 1].astype(np.float32)
+
+            X_meta = np.column_stack(
+                [
+                    tx_lgbm_scores,
+                    tx_cb_scores,
+                    tx_blend_scores,
+                    rf_scores,
+                    fu_scores,
+                ]
+            ).astype(np.float32)
+
+            scores_chunk[group_local_idx] = final_model.predict_proba(X_meta)[:, 1].astype(np.float32)
+            group_counts[group_id] += len(group_local_idx)
+
+            del (
+                group_local_idx,
+                X_group,
                 tx_lgbm_scores,
                 tx_cb_scores,
                 tx_blend_scores,
+                X_rf,
                 rf_scores,
                 fu_scores,
-            ]
-        ).astype(np.float32)
-
-        final_scores = final_model.predict_proba(X_meta)[:, 1].astype(np.float32)
+                X_meta,
+            )
+            gc.collect()
 
         all_event_ids.append(event_ids)
-        all_scores.append(final_scores)
+        all_scores.append(scores_chunk)
         total_test_rows += len(test_chunk)
 
-        del (
-            test_chunk,
-            event_ids,
-            model_group_chunk,
-            X_chunk,
-            tx_lgbm_scores,
-            tx_cb_scores,
-            tx_blend_scores,
-            X_rf,
-            rf_scores,
-            fu_scores,
-            X_meta,
-            final_scores,
-        )
+        del test_chunk, event_ids, model_group_chunk, X_chunk, scores_chunk
         gc.collect()
 
         wall_times.append(time.perf_counter() - t0)
@@ -351,6 +339,8 @@ def score_test_final_ensemble(
     submission.write_csv(submission_path)
 
     print(f"  Test rows scored   : {total_test_rows:,}")
+    for g, name in TX_TYPE_GROUPS.items():
+        print(f"    {name:12s} : {group_counts[g]:,} rows")
     print(f"  Submission written : {submission_path}")
     print("  Score distribution :")
     for pct, lbl in [

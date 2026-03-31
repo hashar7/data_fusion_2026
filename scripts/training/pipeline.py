@@ -45,12 +45,39 @@ from scripts.training.config import RF_MODEL_PATH_FMT, RF_BASE_PARAMS
 
 # ── F vs U catboost ────────────────────────────────────────────────–––––––––––––
 from scripts.training.config import (
-    CATBOOST_FU_MODEL_FILENAME,
+    CATBOOST_FU_MODEL_PATH_FMT
 )
 
 # ── Final ensemble ────────────────────────────────────────────────–––––––––––––
-from catboost import CatBoostClassifier
+import gc
+import glob
+import os
+import time
+import joblib
+from datetime import datetime
+
 import lightgbm as lgb
+import numpy as np
+import polars as pl
+from catboost import CatBoostClassifier
+from sklearn.metrics import average_precision_score
+
+from scripts.training.config import (
+    CATBOOST_BLEND_WEIGHT,
+    CATBOOST_FU_MODEL_PATH_FMT,
+    CATBOOST_PARAMS,
+    FEATURES_DIR,
+    FINAL_ENSEMBLE_MODEL_PATH_FMT,
+    LGBM_MODEL_PATH_FMT,
+    MODELS_DIR,
+    NEG_SAMPLE_RATIO,
+    RF_MODEL_PATH_FMT,
+    STAGING_DIR,
+    SUBMISSION_PATH,
+    TRAIN_END_DATE,
+    TX_TYPE_GROUPS,
+    VAL_CUTOFF_DATE,
+)
 from scripts.training.data import (
     _load_cache,
     build_memmaps,
@@ -59,21 +86,12 @@ from scripts.training.data import (
 )
 from scripts.training.train_catboost import train_catboost_model
 from scripts.training.train_rf import sanitize_rf_features
-from scripts.training._utils import _load_tx_type_catboost_models, _load_rf_bundle, _load_fu_catboost_model, _load_tx_type_lgbm_models
-from scripts.training.predict import score_test_final_ensemble, _score_tx_group_ensemble_chunk
-from scripts.training.config import (
-    VAL_CUTOFF_DATE, TRAIN_END_DATE,
-
-    MODELS_DIR, FEATURES_DIR, STAGING_DIR, 
-    CATBOOST_FU_MODEL_FILENAME, RF_MODEL_FILENAME,
-    FINAL_ENSEMBLE_MODEL_FILENAME, 
-    SUBMISSION_PATH, 
-    LGBM_MODEL_PATH_FMT,
-
-    TX_TYPE_GROUPS, 
-    CATBOOST_PARAMS, CATBOOST_BLEND_WEIGHT,
-    NEG_SAMPLE_RATIO,
+from scripts.training._utils import (
+    _submission_with_suffix, 
+    _load_group_tx_catboost_models, _load_group_tx_lgbm_models, 
+    _load_group_rf_bundles, _load_group_fu_catboost_models,
 )
+from scripts.training.predict import _score_tx_group_ensemble_single_group, score_test_final_ensemble_by_group
 
 
 def _score_val_group(
@@ -180,29 +198,63 @@ def _build_fu_train_mask(
     return train_fu_mask
 
 
-def _score_meta_features_chunked(
+def _sample_binary_indices(y: np.ndarray, neg_ratio: float, seed: int = 42) -> np.ndarray:
+    """
+    Binary target sampling:
+        positives = y == 1
+        negatives = y == 0
+
+    Keep all positives.
+    Keep negatives by ratio of all negatives, but at least as many as positives.
+    """
+    pos_idx = np.flatnonzero(y == 1)
+    neg_idx = np.flatnonzero(y == 0)
+
+    if len(pos_idx) == 0:
+        raise RuntimeError("Sampling subset has zero positive rows.")
+    if len(neg_idx) == 0:
+        raise RuntimeError("Sampling subset has zero negative rows.")
+
+    n_neg_keep = min(len(neg_idx), int(len(neg_idx) * neg_ratio))
+    n_neg_keep = max(n_neg_keep, len(pos_idx))
+    # n_neg_keep = min(n_neg_keep, len(neg_idx))
+
+    rng = np.random.default_rng(seed)
+    if n_neg_keep < len(neg_idx):
+        neg_keep = rng.choice(neg_idx, size=n_neg_keep, replace=False)
+    else:
+        neg_keep = neg_idx.copy()
+
+    sampled_idx = np.concatenate([pos_idx, neg_keep])
+    rng.shuffle(sampled_idx)
+    return sampled_idx.astype(np.int64, copy=False)
+
+
+def _build_meta_features_for_group(
     X_mm: np.ndarray,
     global_indices: np.ndarray,
-    model_groups: np.ndarray,
+    group_id: int,
     tx_lgbm_models: dict[int, list[lgb.Booster]],
     tx_cb_models: dict[int, CatBoostClassifier],
-    rf_bundle: dict,
-    fu_cb_model: CatBoostClassifier,
+    rf_bundles: dict[int, dict],
+    fu_cb_models: dict[int, CatBoostClassifier],
     chunk_size: int = 250_000,
-    suffix: str = "meta scoring",
+    suffix: str = "meta group",
 ) -> np.ndarray:
     """
-    Build meta-features from previously trained models.
+    Build meta-features for one model_group only.
 
     Meta-feature order:
         0 -> tx_type_group LightGBM average score
         1 -> tx_type_group CatBoost score
-        2 -> tx_type_group blended ensemble score
-        3 -> RF F/G score
-        4 -> CatBoost F/U score
+        2 -> tx_type_group blended score
+        3 -> RF skeptic score (per-group RF)
+        4 -> CatBoost F/U score (per-group)
     """
+    rf_bundle = rf_bundles[group_id]
     rf_model = rf_bundle["model"]
     rf_feature_cols = rf_bundle["feature_cols"]
+    fu_cb_model = fu_cb_models[group_id]
 
     n = len(global_indices)
     X_meta = np.empty((n, 5), dtype=np.float32)
@@ -216,20 +268,19 @@ def _score_meta_features_chunked(
 
         idx = global_indices[cs:ce]
         X_c = np.asarray(X_mm[idx], dtype=np.float32)
-        mg_c = np.asarray(model_groups[idx], dtype=np.int8)
 
-        tx_lgbm_scores, tx_cb_scores, tx_blend_scores = _score_tx_group_ensemble_chunk(
+        tx_lgbm_scores, tx_cb_scores, tx_blend_scores = _score_tx_group_ensemble_single_group(
             X_c,
-            mg_c,
+            group_id,
             tx_lgbm_models,
             tx_cb_models,
-            blend_weight=CATBOOST_BLEND_WEIGHT,
         )
 
+        # RF sanitization happens only after row sampling, on selected rows only.
         X_rf = sanitize_rf_features(
             X_c,
             feature_cols=rf_feature_cols,
-            stage=f"{suffix} rf chunk {chunk_i}",
+            stage=f"{suffix} rf group={group_id} chunk={chunk_i}",
         )
         rf_scores = rf_model.predict_proba(X_rf)[:, 1].astype(np.float32)
         fu_scores = fu_cb_model.predict_proba(X_c)[:, 1].astype(np.float32)
@@ -243,7 +294,6 @@ def _score_meta_features_chunked(
         del (
             X_c,
             X_rf,
-            mg_c,
             tx_lgbm_scores,
             tx_cb_scores,
             tx_blend_scores,
@@ -681,28 +731,24 @@ def train_rf_fg_by_group() -> None:
     print("─" * 65)
 
 
-def train_catboost_fu() -> None:
+def train_catboost_fu_by_group() -> None:
     """
-    Train CatBoost on F/U events only.
+    Train one CatBoost model per model_group on F vs U rows only.
 
-    Train rows:
-        keep F (target=1) and U (not present in original labels)
-        drop G (target=0 in original labels)
+    Definitions:
+        F = target == 1
+        U = unlabeled rows (target == 0 in memmap and il_val == 0 on val)
+        G = excluded
 
-    Val rows:
-        keep F and U
-        drop G
-
-    Steps:
-        1. Reload or build memmaps
-        2. Reconstruct F/U train mask from processed parquet partitions
-        3. Build F/U val mask using y_val + is_labeled_val
-        4. Estimate RAM for masked + undersampled train matrix and adjust ratio if needed
-        5. Train CatBoost on train split
-        6. Evaluate on F/U validation subset
-        7. Retrain on train+val combined F/U subset
-        8. Evaluate final model on validation subset
-        9. Save model to MODELS_DIR
+    Per group:
+        1. Build F/U train subset
+        2. Subsample U negatives
+        3. Build F/U validation subset
+        4. Subsample U negatives in validation with same ratio
+        5. Train CatBoost
+        6. Evaluate on validation subset
+        7. Refit on train + val combined subset
+        8. Save final model
     """
     total_start = time.perf_counter()
     cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
@@ -742,266 +788,239 @@ def train_catboost_fu() -> None:
 
     labels = load_labels()
 
-    # ── Step 1: Build F/U masks ──────────────────────────────────────────────
     train_fu_mask = _build_fu_train_mask(files, labels, cutoff)
 
     y_train_np = np.asarray(y_train)
     y_val_np = np.asarray(y_val)
     il_val_np = np.asarray(il_val)
+    tg_train_np = np.asarray(tg_train)
+    tg_val_np = np.asarray(tg_val)
 
-    # Keep F or U on val, drop G.
     val_fu_mask = (y_val_np == 1) | (il_val_np == 0)
 
-    n_train_fu = int(train_fu_mask.sum())
-    n_val_fu = int(val_fu_mask.sum())
+    group_pr_aucs: dict[int, float] = {}
 
-    n_train_pos = int(y_train_np[train_fu_mask].sum()) if n_train_fu > 0 else 0
-    n_train_neg = n_train_fu - n_train_pos  # U only
-    n_val_pos = int(y_val_np[val_fu_mask].sum()) if n_val_fu > 0 else 0
-    n_val_neg = n_val_fu - n_val_pos        # U only
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        sep = "=" * 65
+        print(f"\n{sep}")
+        print(f"  CatBoost F/U model — Group {group_id} — {group_name.upper()}")
+        print(f"{sep}\n")
 
-    print("F/U subset summary:")
-    print(f"  Train rows : {n_train_fu:,}  |  F positives: {n_train_pos:,}  |  U negatives: {n_train_neg:,}")
-    print(f"  Val rows   : {n_val_fu:,}  |  F positives: {n_val_pos:,}  |  U negatives: {n_val_neg:,}\n")
+        train_group_mask = train_fu_mask & (tg_train_np == group_id)
+        val_group_mask = val_fu_mask & (tg_val_np == group_id)
 
-    if n_train_fu == 0 or n_train_pos == 0:
-        raise RuntimeError("F/U train subset is empty or has zero positives.")
-    if n_val_fu == 0 or n_val_pos == 0:
-        raise RuntimeError("F/U val subset is empty or has zero positives.")
+        train_idx_all = np.flatnonzero(train_group_mask)
+        val_idx_all = np.flatnonzero(val_group_mask)
 
-    # ── Step 2: Decide negative sampling ratio based on RAM estimate ────────
-    neg_ratio = NEG_SAMPLE_RATIO
-    n_neg_keep_est = min(n_train_neg, int(n_train_neg * neg_ratio))
-    n_neg_keep_est = max(n_neg_keep_est, n_train_pos)
-    n_rows_fit_est = n_train_pos + n_neg_keep_est
-    est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, len(feature_cols), dtype_bytes=4)
+        if len(train_idx_all) == 0 or len(val_idx_all) == 0:
+            print("  SKIP: no train/val rows for this group.\n")
+            continue
 
-    print("Train matrix RAM estimate after mask + undersampling:")
-    print(f"  NEG_SAMPLE_RATIO candidate : {neg_ratio}")
-    print(f"  Positives kept             : {n_train_pos:,}")
-    print(f"  Negatives kept             : {n_neg_keep_est:,}")
-    print(f"  Final train rows           : {n_rows_fit_est:,}")
-    print(f"  Estimated X RAM            : {est_ram_gb:.3f} GB")
+        y_train_g_all = y_train_np[train_idx_all].astype(np.int8, copy=False)
+        y_val_g_all = y_val_np[val_idx_all].astype(np.int8, copy=False)
 
-    # Threshold for CatBoost on a 16 GB machine.
-    if est_ram_gb > 10.0:
-        neg_ratio = neg_ratio / 5
-        n_neg_keep_est = min(n_train_neg, int(n_train_pos * neg_ratio))
-        n_rows_fit_est = n_train_pos + n_neg_keep_est
-        est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, len(feature_cols), dtype_bytes=4)
+        train_pos_idx_local = np.flatnonzero(y_train_g_all == 1)
+        train_u_idx_local = np.flatnonzero(y_train_g_all == 0)
 
-        print("\n  Estimated RAM is heavy - switching NEG_SAMPLE_RATIO to 0.01")
-        print(f"  Adjusted negatives kept    : {n_neg_keep_est:,}")
-        print(f"  Adjusted final train rows  : {n_rows_fit_est:,}")
-        print(f"  Adjusted estimated X RAM   : {est_ram_gb:.3f} GB")
-    print()
+        val_pos_idx_local = np.flatnonzero(y_val_g_all == 1)
+        val_u_idx_local = np.flatnonzero(y_val_g_all == 0)
 
-    # ── Step 3: Prepare validation subset in RAM ─────────────────────────────
-    print("Loading F/U validation subset into RAM …", flush=True)
-    val_pos_idx = np.flatnonzero(y_val_np == 1)
-    val_u_idx_all = np.flatnonzero((y_val_np == 0) & (il_val_np == 0))
+        n_train_pos = len(train_pos_idx_local)
+        n_train_u = len(train_u_idx_local)
+        n_val_pos = len(val_pos_idx_local)
+        n_val_u = len(val_u_idx_local)
 
-    n_val_pos = len(val_pos_idx)
-    n_val_u = len(val_u_idx_all)
+        print(f"  Train rows before sampling : {len(train_idx_all):,}  |  F positives: {n_train_pos:,}  |  U negatives: {n_train_u:,}")
+        print(f"  Val rows before sampling   : {len(val_idx_all):,}  |  F positives: {n_val_pos:,}  |  U negatives: {n_val_u:,}\n")
 
-    n_val_u_keep = min(n_val_u, int(n_val_u * neg_ratio))
-    n_val_u_keep = max(n_val_u_keep, n_val_pos)
+        if n_train_pos == 0 or n_train_u == 0:
+            print("  SKIP: train subset has only one class.\n")
+            continue
+        if n_val_pos == 0 or n_val_u == 0:
+            print("  SKIP: val subset has only one class.\n")
+            continue
 
-    rng = np.random.default_rng(UNDERSAMPLE_SEED)
-    if n_val_u_keep < n_val_u:
-        val_u_idx = rng.choice(val_u_idx_all, size=n_val_u_keep, replace=False)
-    else:
-        val_u_idx = val_u_idx_all
+        neg_ratio = NEG_SAMPLE_RATIO
 
-    val_fu_idx = np.concatenate([val_pos_idx, val_u_idx])
-    rng.shuffle(val_fu_idx)
+        n_train_u_keep = min(n_train_u, int(n_train_u * neg_ratio))
+        n_train_u_keep = max(n_train_u_keep, n_train_pos)
+        # n_train_u_keep = min(n_train_u_keep, n_train_u)
 
-    X_val_fu = np.asarray(X_val[val_fu_idx], dtype=np.float32)
-    y_val_fu = np.asarray(y_val_np[val_fu_idx], dtype=np.int8)
-    il_val_ones_fu = np.ones(len(val_fu_idx), dtype=np.int8)
+        train_rows_fit_est = n_train_pos + n_train_u_keep
+        est_ram_gb = _estimate_matrix_ram_gb(train_rows_fit_est, len(feature_cols), dtype_bytes=4)
 
-    print("Validation subset after negative subsampling:")
-    print(f"  F positives kept : {n_val_pos:,}")
-    print(f"  U negatives kept : {len(val_u_idx):,}")
-    print(f"  X_val_fu shape : {X_val_fu.shape}")
-    print(f"  y_val_fu rows  : {len(y_val_fu):,}\n")
+        print("  Train RAM estimate after negative subsampling:")
+        print(f"    NEG_SAMPLE_RATIO : {neg_ratio}")
+        print(f"    Positives kept   : {n_train_pos:,}")
+        print(f"    Negatives kept   : {n_train_u_keep:,}")
+        print(f"    Final train rows : {train_rows_fit_est:,}")
+        print(f"    Estimated X RAM  : {est_ram_gb:.3f} GB")
 
-    # ── Step 4: Train on train split ─────────────────────────────────────────
-    print("=" * 65)
-    print("  CatBoost F/U model - train split")
-    print("=" * 65)
-    print()
+        if est_ram_gb > 6.0 and neg_ratio > 0.01:
+            neg_ratio = 0.01
+            n_train_u_keep = min(n_train_u, int(n_train_u * neg_ratio))
+            n_train_u_keep = max(n_train_u_keep, n_train_pos)
+            # n_train_u_keep = min(n_train_u_keep, n_train_u)
 
-    cb_model = train_catboost_model(
-        X_train,
-        y_train,
-        X_val_fu,
-        y_val_fu,
-        il_val_ones_fu,
-        feature_cols,
-        train_row_mask=train_fu_mask,
-        neg_sample_ratio=neg_ratio,
-        catboost_params=CATBOOST_PARAMS,
-    )
+            train_rows_fit_est = n_train_pos + n_train_u_keep
+            est_ram_gb = _estimate_matrix_ram_gb(train_rows_fit_est, len(feature_cols), dtype_bytes=4)
 
-    # model_path = os.path.join(MODELS_DIR, CATBOOST_FU_MODEL_FILENAME)
-    # cb_model.save_model(model_path)
-    # print(f"\nCatBoost F/U model saved → {model_path}\n", flush=True)
-
-    print("Scoring F/U validation rows …", flush=True)
-    val_scores = _score_val_group(
-        cb_model,
-        X_val,
-        val_fu_idx,
-        is_catboost=True,
-        suffix="catboost f/u val",
-    )
-    val_pr_auc = average_precision_score(y_val_fu, val_scores)
-    print(f"\nValidation PR-AUC [F/U CatBoost]: {val_pr_auc:.6f}\n", flush=True)
-
-    # ── Step 5: Refit on train + val combined F/U subset ────────────────────
-    print("=" * 65)
-    print("  CatBoost F/U model - train + val combined")
-    print("=" * 65)
-    print()
-
-    train_pos_idx = np.flatnonzero(train_fu_mask & (y_train_np == 1))
-    train_neg_idx_all = np.flatnonzero(train_fu_mask & (y_train_np == 0))
-
-    val_pos_idx = np.flatnonzero(val_fu_mask & (y_val_np == 1))
-    val_neg_idx_all = np.flatnonzero(val_fu_mask & (y_val_np == 0))
-
-    n_pos_full = len(train_pos_idx) + len(val_pos_idx)
-    n_neg_full = len(train_neg_idx_all) + len(val_neg_idx_all)
-    n_neg_keep_full = min(n_neg_full, int(n_neg_full * neg_ratio))
-
-    if n_neg_full > 0 and n_neg_keep_full > 0:
-        share_train = len(train_neg_idx_all) / n_neg_full
-        n_neg_keep_train = min(len(train_neg_idx_all), int(round(n_neg_keep_full * share_train)))
-        n_neg_keep_val = min(len(val_neg_idx_all), n_neg_keep_full - n_neg_keep_train)
-
-        # Fix any rounding remainder.
-        shortfall = n_neg_keep_full - (n_neg_keep_train + n_neg_keep_val)
-        if shortfall > 0:
-            extra_train = min(shortfall, len(train_neg_idx_all) - n_neg_keep_train)
-            n_neg_keep_train += extra_train
-            shortfall -= extra_train
-        if shortfall > 0:
-            extra_val = min(shortfall, len(val_neg_idx_all) - n_neg_keep_val)
-            n_neg_keep_val += extra_val
+            print("    Estimated RAM is heavy - switching NEG_SAMPLE_RATIO to 0.01")
+            print(f"    Adjusted negatives kept : {n_train_u_keep:,}")
+            print(f"    Adjusted train rows     : {train_rows_fit_est:,}")
+            print(f"    Adjusted X RAM          : {est_ram_gb:.3f} GB")
+        print()
 
         rng = np.random.default_rng(UNDERSAMPLE_SEED)
-        train_neg_idx = (
-            rng.choice(train_neg_idx_all, size=n_neg_keep_train, replace=False)
-            if n_neg_keep_train > 0 else np.empty(0, dtype=np.int64)
+
+        if n_train_u_keep < n_train_u:
+            train_u_keep_local = rng.choice(train_u_idx_local, size=n_train_u_keep, replace=False)
+        else:
+            train_u_keep_local = train_u_idx_local.copy()
+
+        train_idx_local = np.concatenate([train_pos_idx_local, train_u_keep_local])
+        rng.shuffle(train_idx_local)
+        train_idx_g = train_idx_all[train_idx_local]
+
+        n_val_u_keep = min(n_val_u, int(n_val_u * neg_ratio))
+        n_val_u_keep = max(n_val_u_keep, n_val_pos)
+        # n_val_u_keep = min(n_val_u_keep, n_val_u)
+
+        if n_val_u_keep < n_val_u:
+            val_u_keep_local = rng.choice(val_u_idx_local, size=n_val_u_keep, replace=False)
+        else:
+            val_u_keep_local = val_u_idx_local.copy()
+
+        val_idx_local = np.concatenate([val_pos_idx_local, val_u_keep_local])
+        rng.shuffle(val_idx_local)
+        val_idx_g = val_idx_all[val_idx_local]
+
+        print("  Validation subset after negative subsampling:")
+        print(f"    F positives kept : {n_val_pos:,}")
+        print(f"    U negatives kept : {len(val_u_keep_local):,}")
+        print(f"    Final val rows   : {len(val_idx_g):,}\n")
+
+        X_train_g = np.asarray(X_train[train_idx_g], dtype=np.float32)
+        y_train_g = y_train_np[train_idx_g].astype(np.int8, copy=False)
+
+        X_val_g = np.asarray(X_val[val_idx_g], dtype=np.float32)
+        y_val_g = y_val_np[val_idx_g].astype(np.int8, copy=False)
+        il_val_ones_g = np.ones(len(y_val_g), dtype=np.int8)
+
+        print(f"  X_train_g shape : {X_train_g.shape}")
+        print(f"  X_val_g shape   : {X_val_g.shape}\n")
+
+        print("  Training CatBoost …", flush=True)
+        cb_model = train_catboost_model(
+            X_train_g,
+            y_train_g,
+            X_val_g,
+            y_val_g,
+            il_val_ones_g,
+            feature_cols,
+            train_row_mask=None,
+            neg_sample_ratio=None,
+            catboost_params=CATBOOST_PARAMS,
         )
-        val_neg_idx = (
-            rng.choice(val_neg_idx_all, size=n_neg_keep_val, replace=False)
-            if n_neg_keep_val > 0 else np.empty(0, dtype=np.int64)
+
+        model_path = os.path.join(
+            MODELS_DIR,
+            CATBOOST_FU_MODEL_PATH_FMT.format(name=group_name),
         )
-    else:
-        train_neg_idx = np.empty(0, dtype=np.int64)
-        val_neg_idx = np.empty(0, dtype=np.int64)
+        cb_model.save_model(model_path)
+        print(f"\n  CatBoost F/U model saved → {model_path}\n", flush=True)
 
-    print("Combined F/U refit subset:")
-    print(f"  Positives kept : {n_pos_full:,}")
-    print(f"  Negatives kept : {len(train_neg_idx) + len(val_neg_idx):,}")
-    print(f"  Total rows     : {n_pos_full + len(train_neg_idx) + len(val_neg_idx):,}\n")
+        val_scores = cb_model.predict_proba(X_val_g)[:, 1].astype(np.float32)
+        val_pr_auc = average_precision_score(y_val_g, val_scores)
+        group_pr_aucs[group_id] = val_pr_auc
 
-    X_full_fu = np.concatenate(
-        [
-            np.asarray(X_train[train_pos_idx], dtype=np.float32),
-            np.asarray(X_val[val_pos_idx], dtype=np.float32),
-            np.asarray(X_train[train_neg_idx], dtype=np.float32),
-            np.asarray(X_val[val_neg_idx], dtype=np.float32),
-        ],
-        axis=0,
-    )
+        print(f"  Validation PR-AUC [{group_name} CatBoost F/U]: {val_pr_auc:.6f}\n", flush=True)
 
-    y_full_fu = np.concatenate(
-        [
-            np.ones(len(train_pos_idx), dtype=np.int8),
-            np.ones(len(val_pos_idx), dtype=np.int8),
-            np.zeros(len(train_neg_idx), dtype=np.int8),
-            np.zeros(len(val_neg_idx), dtype=np.int8),
-        ],
-        axis=0,
-    )
+        print("  Refit on train + val combined …", flush=True)
 
-    rng = np.random.default_rng(UNDERSAMPLE_SEED)
-    perm = rng.permutation(len(y_full_fu))
-    X_full_fu = X_full_fu[perm]
-    y_full_fu = y_full_fu[perm]
+        X_full_g = np.concatenate([X_train_g, X_val_g], axis=0)
+        y_full_g = np.concatenate([y_train_g, y_val_g], axis=0)
 
-    final_cb_model = train_catboost_model(
-        X_full_fu,
-        y_full_fu,
-        X_val_fu,
-        y_val_fu,
-        il_val_ones_fu,
-        feature_cols,
-        train_row_mask=None,
-        neg_sample_ratio=None,
-        catboost_params=CATBOOST_PARAMS,
-    )
+        final_cb_model = train_catboost_model(
+            X_full_g,
+            y_full_g,
+            X_val_g,
+            y_val_g,
+            il_val_ones_g,
+            feature_cols,
+            train_row_mask=None,
+            neg_sample_ratio=None,
+            catboost_params=CATBOOST_PARAMS,
+        )
 
-    final_model_path = os.path.join(MODELS_DIR, CATBOOST_FU_MODEL_FILENAME)
-    final_cb_model.save_model(final_model_path)
-    print(f"\nFinal CatBoost F/U model saved → {final_model_path}\n", flush=True)
+        final_cb_model.save_model(model_path)
+        print(f"  Final CatBoost F/U model saved → {model_path}\n", flush=True)
 
-    print("Scoring F/U validation rows with final model …", flush=True)
-    final_val_scores = final_cb_model.predict_proba(X_val_fu)[:, 1].astype(np.float32)
-    final_val_pr_auc = average_precision_score(y_val_fu, final_val_scores)
-    print(f"\nFinal validation PR-AUC [F/U CatBoost]: {final_val_pr_auc:.6f}\n", flush=True)
+        final_val_scores = final_cb_model.predict_proba(X_val_g)[:, 1].astype(np.float32)
+        final_val_pr_auc = average_precision_score(y_val_g, final_val_scores)
+        print(f"  Final validation PR-AUC [{group_name} CatBoost F/U]: {final_val_pr_auc:.6f}\n", flush=True)
 
-    del (
-        labels,
-        train_fu_mask,
-        val_fu_mask,
-        X_val_fu,
-        y_val_fu,
-        il_val_ones_fu,
-        val_scores,
-        train_pos_idx,
-        train_neg_idx_all,
-        val_pos_idx,
-        val_neg_idx_all,
-        train_neg_idx,
-        val_neg_idx,
-        X_full_fu,
-        y_full_fu,
-        final_val_scores,
-        y_train_np,
-        y_val_np,
-        il_val_np,
-    )
-    gc.collect()
+        del (
+            train_idx_all,
+            val_idx_all,
+            y_train_g_all,
+            y_val_g_all,
+            train_pos_idx_local,
+            train_u_idx_local,
+            val_pos_idx_local,
+            val_u_idx_local,
+            train_u_keep_local,
+            val_u_keep_local,
+            train_idx_local,
+            val_idx_local,
+            train_idx_g,
+            val_idx_g,
+            X_train_g,
+            y_train_g,
+            X_val_g,
+            y_val_g,
+            il_val_ones_g,
+            cb_model,
+            val_scores,
+            X_full_g,
+            y_full_g,
+            final_cb_model,
+            final_val_scores,
+        )
+        gc.collect()
 
-    print("─" * 65)
-    print(f"Total wall time           : {_fmt(time.perf_counter() - total_start)}")
-    print(f"Validation PR-AUC         : {val_pr_auc:.6f}")
-    print(f"Final validation PR-AUC   : {final_val_pr_auc:.6f}")
+    print(f"\n{'=' * 65}")
+    print("  CatBoost F/U validation summary")
+    print(f"{'=' * 65}\n")
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        if group_id in group_pr_aucs:
+            print(f"  {group_name:12s} CatBoost F/U PR-AUC : {group_pr_aucs[group_id]:.6f}")
+
+    print(f"\n{'─' * 65}")
+    print(f"Total wall time : {_fmt(time.perf_counter() - total_start)}")
     print("─" * 65)
 
 
-def train_final_ensemble() -> None:
+def train_final_ensemble_by_group() -> None:
     """
-    Train final CatBoost ensemble on outputs of previous models:
+    Train one final CatBoost ensemble per model_group on outputs of previous models:
 
         1. tx_type_group LightGBM score
         2. tx_type_group CatBoost score
-        3. tx_type_group blended score (same as train_baseline)
-        4. RF score trained on F vs G
+        3. tx_type_group blended score
+        4. RF skeptic score trained on G vs F
         5. CatBoost score trained on F vs U
 
     Final ensemble target:
         1 = F
         0 = G + U
 
-    Negative subsampling:
-        n_neg_keep = min(n_neg, int(n_neg * NEG_SAMPLE_RATIO))
-        n_neg_keep = max(n_neg_keep, n_pos)
-        n_neg_keep = min(n_neg_keep, n_neg)
+    Negative subsampling is done before meta-feature construction.
+    RF sanitization therefore happens only on selected sampled rows.
+
+    Writes two submissions:
+        - before refit on train+val
+        - after refit on train+val
     """
     total_start = time.perf_counter()
     cutoff = datetime.fromisoformat(VAL_CUTOFF_DATE)
@@ -1044,185 +1063,213 @@ def train_final_ensemble() -> None:
     tg_train_np = np.asarray(tg_train)
     tg_val_np = np.asarray(tg_val)
 
-    train_idx = np.arange(len(y_train_np), dtype=np.int64)
-    val_idx = np.arange(len(y_val_np), dtype=np.int64)
-
-    n_train_pos = int(y_train_np.sum())
-    n_train_neg = len(y_train_np) - n_train_pos
-    n_val_pos = int(y_val_np.sum())
-    n_val_neg = len(y_val_np) - n_val_pos
-
-    print("Final ensemble full-data summary:")
-    print(
-        f"  Train rows : {len(y_train_np):,}  |  "
-        f"F positives: {n_train_pos:,}  |  non-fraud negatives (G+U): {n_train_neg:,}"
-    )
-    print(
-        f"  Val rows   : {len(y_val_np):,}  |  "
-        f"F positives: {n_val_pos:,}  |  non-fraud negatives (G+U): {n_val_neg:,}\n"
-    )
-
-    neg_ratio = NEG_SAMPLE_RATIO
-    n_neg_keep_est = min(n_train_neg, int(n_train_neg * neg_ratio))
-    n_neg_keep_est = max(n_neg_keep_est, n_train_pos)
-
-    n_rows_fit_est = n_train_pos + n_neg_keep_est
-    est_ram_gb = _estimate_matrix_ram_gb(n_rows_fit_est, 5, dtype_bytes=4)
-
-    print("Final ensemble train matrix RAM estimate after negative subsampling:")
-    print(f"  NEG_SAMPLE_RATIO candidate : {neg_ratio}")
-    print(f"  Positives kept             : {n_train_pos:,}")
-    print(f"  Negatives kept             : {n_neg_keep_est:,}")
-    print(f"  Final train rows           : {n_rows_fit_est:,}")
-    print(f"  Estimated X RAM            : {est_ram_gb:.6f} GB\n")
-
-    tx_lgbm_models = _load_tx_type_lgbm_models(MODELS_DIR)
-    tx_cb_models = _load_tx_type_catboost_models(MODELS_DIR)
-    rf_bundle = _load_rf_bundle(MODELS_DIR)
-    fu_cb_model = _load_fu_catboost_model(MODELS_DIR)
-
-    print("=" * 65)
-    print("  Building train meta-features")
-    print("=" * 65)
-    print()
-
-    X_meta_train = _score_meta_features_chunked(
-        X_train,
-        train_idx,
-        tg_train_np,
-        tx_lgbm_models,
-        tx_cb_models,
-        rf_bundle,
-        fu_cb_model,
-        suffix="meta train",
-    )
-    y_meta_train = y_train_np.astype(np.int8, copy=False)
-
-    print("=" * 65)
-    print("  Building validation meta-features")
-    print("=" * 65)
-    print()
-
-    X_meta_val = _score_meta_features_chunked(
-        X_val,
-        val_idx,
-        tg_val_np,
-        tx_lgbm_models,
-        tx_cb_models,
-        rf_bundle,
-        fu_cb_model,
-        suffix="meta val",
-    )
-    y_meta_val = y_val_np.astype(np.int8, copy=False)
-    il_meta_val = np.ones(len(y_meta_val), dtype=np.int8)
-
-    print("Meta-feature matrices:")
-    print(f"  X_meta_train shape : {X_meta_train.shape}")
-    print(f"  X_meta_val shape   : {X_meta_val.shape}\n")
+    tx_lgbm_models = _load_group_tx_lgbm_models(MODELS_DIR)
+    tx_cb_models = _load_group_tx_catboost_models(MODELS_DIR)
+    rf_bundles = _load_group_rf_bundles(MODELS_DIR)
+    fu_cb_models = _load_group_fu_catboost_models(MODELS_DIR)
 
     meta_feature_cols = [
         "score_tx_group_lgbm",
         "score_tx_group_catboost",
         "score_tx_group_blend",
-        "score_rf_fg",
+        "score_rf_skeptic",
         "score_catboost_fu",
     ]
 
-    print("=" * 65)
-    print("  Final ensemble CatBoost - train split")
-    print("=" * 65)
-    print()
+    final_models_pre_refit: dict[int, CatBoostClassifier] = {}
+    final_models_post_refit: dict[int, CatBoostClassifier] = {}
+    group_pr_aucs: dict[int, float] = {}
 
-    final_model = train_catboost_model(
-        X_meta_train,
-        y_meta_train,
-        X_meta_val,
-        y_meta_val,
-        il_meta_val,
-        meta_feature_cols,
-        train_row_mask=None,
-        neg_sample_ratio=neg_ratio,
-        catboost_params=CATBOOST_PARAMS,
-    )
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        sep = "=" * 65
+        print(f"\n{sep}")
+        print(f"  Final ensemble — Group {group_id} — {group_name.upper()}")
+        print(f"{sep}\n")
 
-    model_path = os.path.join(MODELS_DIR, FINAL_ENSEMBLE_MODEL_FILENAME)
-    final_model.save_model(model_path)
-    print(f"\nFinal ensemble model saved → {model_path}\n", flush=True)
+        train_group_idx_all = np.flatnonzero(tg_train_np == group_id)
+        val_group_idx_all = np.flatnonzero(tg_val_np == group_id)
 
-    val_scores = final_model.predict_proba(X_meta_val)[:, 1].astype(np.float32)
-    val_pr_auc = average_precision_score(y_meta_val, val_scores)
-    print(f"Validation PR-AUC [final ensemble]: {val_pr_auc:.6f}\n", flush=True)
+        if len(train_group_idx_all) == 0 or len(val_group_idx_all) == 0:
+            print("  SKIP: no train/val rows for this group.\n")
+            continue
 
-    print("=" * 65)
-    print("  Final ensemble CatBoost - train + val combined")
-    print("=" * 65)
-    print()
+        y_train_group_all = y_train_np[train_group_idx_all].astype(np.int8, copy=False)
+        y_val_group_all = y_val_np[val_group_idx_all].astype(np.int8, copy=False)
 
-    X_meta_full = np.concatenate([X_meta_train, X_meta_val], axis=0)
-    y_meta_full = np.concatenate([y_meta_train, y_meta_val], axis=0)
+        n_train_pos = int(y_train_group_all.sum())
+        n_train_neg = len(y_train_group_all) - n_train_pos
+        n_val_pos = int(y_val_group_all.sum())
+        n_val_neg = len(y_val_group_all) - n_val_pos
 
-    n_pos_full = int(y_meta_full.sum())
-    n_neg_full = len(y_meta_full) - n_pos_full
-    n_neg_keep_full = min(n_neg_full, int(n_neg_full * neg_ratio))
-    n_neg_keep_full = max(n_neg_keep_full, n_pos_full)
-    n_neg_keep_full = min(n_neg_keep_full, n_neg_full)
+        print(f"  Train rows before sampling : {len(train_group_idx_all):,}  |  F positives: {n_train_pos:,}  |  non-fraud negatives: {n_train_neg:,}")
+        print(f"  Val rows before sampling   : {len(val_group_idx_all):,}  |  F positives: {n_val_pos:,}  |  non-fraud negatives: {n_val_neg:,}\n")
 
-    print("Combined refit subset before internal subsampling:")
-    print(f"  Positives total           : {n_pos_full:,}")
-    print(f"  Negatives total           : {n_neg_full:,}")
-    print(f"  Target negatives after ratio : {n_neg_keep_full:,}")
-    print(f"  Total rows available      : {len(y_meta_full):,}\n")
+        if n_train_pos == 0 or n_train_neg == 0:
+            print("  SKIP: train subset has only one class.\n")
+            continue
+        if n_val_pos == 0 or n_val_neg == 0:
+            print("  SKIP: val subset has only one class.\n")
+            continue
 
-    final_model_refit = train_catboost_model(
-        X_meta_full,
-        y_meta_full,
-        X_meta_val,
-        y_meta_val,
-        il_meta_val,
-        meta_feature_cols,
-        train_row_mask=None,
-        neg_sample_ratio=neg_ratio,
-        catboost_params=CATBOOST_PARAMS,
-    )
+        train_sample_local = _sample_binary_indices(
+            y_train_group_all,
+            neg_ratio=NEG_SAMPLE_RATIO,
+            seed=42 + group_id,
+        )
+        val_sample_local = _sample_binary_indices(
+            y_val_group_all,
+            neg_ratio=NEG_SAMPLE_RATIO,
+            seed=42 + group_id,
+        )
 
-    final_model_refit.save_model(model_path)
-    print(f"\nRefit final ensemble model saved → {model_path}\n", flush=True)
+        train_idx_g = train_group_idx_all[train_sample_local]
+        val_idx_g = val_group_idx_all[val_sample_local]
 
-    final_val_scores = final_model_refit.predict_proba(X_meta_val)[:, 1].astype(np.float32)
-    final_val_pr_auc = average_precision_score(y_meta_val, final_val_scores)
-    print(f"Final validation PR-AUC [final ensemble]: {final_val_pr_auc:.6f}\n", flush=True)
+        y_train_g = y_train_np[train_idx_g].astype(np.int8, copy=False)
+        y_val_g = y_val_np[val_idx_g].astype(np.int8, copy=False)
 
-    score_test_final_ensemble(
-        final_model_refit,
+        n_train_pos_kept = int(y_train_g.sum())
+        n_train_neg_kept = len(y_train_g) - n_train_pos_kept
+        n_val_pos_kept = int(y_val_g.sum())
+        n_val_neg_kept = len(y_val_g) - n_val_pos_kept
+
+        est_ram_gb = _estimate_matrix_ram_gb(len(train_idx_g), 5, dtype_bytes=4)
+
+        print("  Sampled subset summary:")
+        print(f"    Train positives kept : {n_train_pos_kept:,}")
+        print(f"    Train negatives kept : {n_train_neg_kept:,}")
+        print(f"    Train rows kept      : {len(train_idx_g):,}")
+        print(f"    Train meta X RAM est : {est_ram_gb:.6f} GB")
+        print(f"    Val positives kept   : {n_val_pos_kept:,}")
+        print(f"    Val negatives kept   : {n_val_neg_kept:,}")
+        print(f"    Val rows kept        : {len(val_idx_g):,}\n")
+
+        print("  Building sampled train meta-features …", flush=True)
+        X_meta_train = _build_meta_features_for_group(
+            X_train,
+            train_idx_g,
+            group_id,
+            tx_lgbm_models,
+            tx_cb_models,
+            rf_bundles,
+            fu_cb_models,
+            suffix=f"meta train {group_name}",
+        )
+
+        print("  Building sampled validation meta-features …", flush=True)
+        X_meta_val = _build_meta_features_for_group(
+            X_val,
+            val_idx_g,
+            group_id,
+            tx_lgbm_models,
+            tx_cb_models,
+            rf_bundles,
+            fu_cb_models,
+            suffix=f"meta val {group_name}",
+        )
+        il_meta_val = np.ones(len(y_val_g), dtype=np.int8)
+
+        print(f"  X_meta_train shape : {X_meta_train.shape}")
+        print(f"  X_meta_val shape   : {X_meta_val.shape}\n")
+
+        print("  Training final CatBoost on train split …", flush=True)
+        final_model = train_catboost_model(
+            X_meta_train,
+            y_train_g,
+            X_meta_val,
+            y_val_g,
+            il_meta_val,
+            meta_feature_cols,
+            train_row_mask=None,
+            neg_sample_ratio=None,
+            catboost_params=CATBOOST_PARAMS,
+        )
+
+        model_path = os.path.join(
+            MODELS_DIR,
+            FINAL_ENSEMBLE_MODEL_PATH_FMT.format(name=group_name),
+        )
+        final_model.save_model(model_path)
+        final_models_pre_refit[group_id] = final_model
+        print(f"  Final ensemble model saved → {model_path}\n", flush=True)
+
+        val_scores = final_model.predict_proba(X_meta_val)[:, 1].astype(np.float32)
+        val_pr_auc = average_precision_score(y_val_g, val_scores)
+        group_pr_aucs[group_id] = val_pr_auc
+        print(f"  Validation PR-AUC [{group_name} final ensemble]: {val_pr_auc:.6f}\n", flush=True)
+
+        print("  Refit on sampled train + val combined …", flush=True)
+        X_meta_full = np.concatenate([X_meta_train, X_meta_val], axis=0)
+        y_meta_full = np.concatenate([y_train_g, y_val_g], axis=0)
+
+        final_model_refit = train_catboost_model(
+            X_meta_full,
+            y_meta_full,
+            X_meta_val,
+            y_val_g,
+            il_meta_val,
+            meta_feature_cols,
+            train_row_mask=None,
+            neg_sample_ratio=None,
+            catboost_params=CATBOOST_PARAMS,
+        )
+
+        final_model_refit.save_model(model_path)
+        final_models_post_refit[group_id] = final_model_refit
+        print(f"  Refit final ensemble model saved → {model_path}\n", flush=True)
+
+        del (
+            train_group_idx_all,
+            val_group_idx_all,
+            y_train_group_all,
+            y_val_group_all,
+            train_sample_local,
+            val_sample_local,
+            train_idx_g,
+            val_idx_g,
+            y_train_g,
+            y_val_g,
+            X_meta_train,
+            X_meta_val,
+            X_meta_full,
+            y_meta_full,
+            il_meta_val,
+            val_scores,
+        )
+        gc.collect()
+
+    print(f"\n{'=' * 65}")
+    print("  Final ensemble validation summary")
+    print(f"{'=' * 65}\n")
+    for group_id, group_name in TX_TYPE_GROUPS.items():
+        if group_id in group_pr_aucs:
+            print(f"  {group_name:12s} Final ensemble PR-AUC : {group_pr_aucs[group_id]:.6f}")
+
+    submission_pre_refit = _submission_with_suffix(SUBMISSION_PATH, "pre_refit")
+    submission_post_refit = _submission_with_suffix(SUBMISSION_PATH, "post_refit")
+
+    score_test_final_ensemble_by_group(
+        final_models_pre_refit,
         tx_lgbm_models,
         tx_cb_models,
-        rf_bundle,
-        fu_cb_model,
+        rf_bundles,
+        fu_cb_models,
         feature_cols,
-        SUBMISSION_PATH,
+        submission_pre_refit,
     )
 
-    del (
-        y_train_np,
-        y_val_np,
-        tg_train_np,
-        tg_val_np,
-        train_idx,
-        val_idx,
-        X_meta_train,
-        y_meta_train,
-        X_meta_val,
-        y_meta_val,
-        il_meta_val,
-        val_scores,
-        X_meta_full,
-        y_meta_full,
-        final_val_scores,
+    score_test_final_ensemble_by_group(
+        final_models_post_refit,
+        tx_lgbm_models,
+        tx_cb_models,
+        rf_bundles,
+        fu_cb_models,
+        feature_cols,
+        submission_post_refit,
     )
-    gc.collect()
 
-    print("─" * 65)
-    print(f"Total wall time           : {_fmt(time.perf_counter() - total_start)}")
-    print(f"Validation PR-AUC         : {val_pr_auc:.6f}")
-    print(f"Final validation PR-AUC   : {final_val_pr_auc:.6f}")
+    print(f"\n{'─' * 65}")
+    print(f"Total wall time : {_fmt(time.perf_counter() - total_start)}")
+    print(f"Submission before refit : {submission_pre_refit}")
+    print(f"Submission after refit  : {submission_post_refit}")
     print("─" * 65)
